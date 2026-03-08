@@ -35,24 +35,6 @@
 
 ---
 
-## 📈 部分实验结果
-
-<div align="center">
-<img src="figure/Thinking efficiency2.png" width="38%"/>  <img src="figure/Passk2.png" width="50%"/>
-</div>
-
-<p align="center"><em>（左）LEAD 以更短的推理长度获得更高准确率；（右）Pass@k 采样效率对比。</em></p>
-
-<div align="center">
-<img src="figure/Fluency2.png" width="50%"/> <img src="figure/example/visualization.png" width="42%"/>
-</div>
-
-<p align="center"><em>（左）文本质量评测；（右）Token 级可视化分析。</em></p>
-
-更多结果与分析请参见论文。
-
----
-
 ## 🛠️ 环境配置
 
 ### 1. 克隆仓库
