@@ -79,6 +79,23 @@
       min-height: 740px;
     }
 
+    /* 标题行：LEAD 与右侧图片并排 */
+    .hero-title-row {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+    }
+
+    .hero-title-row .title-img {
+      width: clamp(120px, 18vw, 200px);
+      height: auto;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+      object-fit: contain;
+    }
+
     .hero h1 {
       margin: 0;
       font-size: clamp(56px, 8vw, 100px);
@@ -378,7 +395,10 @@
 
       <section class="hero">
         <div class="hero-copy">
-          <h1>LEAD</h1>
+          <div class="hero-title-row">
+            <h1>LEAD</h1>
+            <img class="title-img" src="ChatGPT Image 2026年3月9日 20_43_50.png" alt="LEAD" />
+          </div>
           <h2>Latent Entropy-Aware Decoding for Reliable Multimodal Reasoning</h2>
           <p class="hero-desc">
             <strong>Thinking in Uncertainty: Mitigating Hallucinations in MLRMs with Latent Entropy-Aware Decoding.</strong>
