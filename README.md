@@ -12,61 +12,61 @@
 
 </div>
 
-## 🔥 最新动态
+## 🔥 Latest Updates
 
-- **[2026/01]** 🎉 LEAD 被 **CVPR 2026** 接收！
-- **[2026/03]** 代码和数据集已开源。
+- **[2026/01]** 🎉 LEAD was accepted to **CVPR 2026**!
+- **[2026/03]** The code and datasets have been released.
 
 ---
 
-## 📌 概述
+## 📌 Overview
 
-**LEAD**（Latent Entropy-Aware Decoding）是一种 **无需训练（training-free）** 的解码策略，旨在缓解多模态大推理模型（MLRMs）中的幻觉问题。LEAD 通过实时监测 token 概率分布的熵值，自适应地在 **潜在解码（latent decoding）** 和 **离散解码（discrete decoding）** 之间动态切换，并在高不确定性节点注入视觉锚点以强化视觉 grounding。
+**LEAD** (Latent Entropy-Aware Decoding) is a **training-free** decoding strategy designed to mitigate hallucinations in Multimodal Large Reasoning Models (MLRMs). LEAD dynamically switches between **latent decoding** and **discrete decoding** by monitoring the entropy of token probability distributions in real time, and injects visual anchors at highly uncertain steps to strengthen visual grounding.
 
 <div align="center">
 <img src="figure/method.png" width="80%"/>
 </div>
 
-## 💡 核心亮点
+## 💡 Key Highlights
 
-- **熵感知切换**：高熵阶段采用概率加权的连续 embedding 进行 latent reasoning；低熵阶段恢复离散 token decoding 保证收敛性。
-- **视觉锚点注入**：在不确定推理的关键时刻注入视觉 anchor token，减少模型脱离图像内容的"脑补式"推理。
-- **即插即用**：无需额外训练或外部工具，可直接应用于现有 MLRMs。
+- **Entropy-aware switching**: Uses probability-weighted continuous embeddings for latent reasoning during high-entropy stages, and returns to discrete token decoding during low-entropy stages to ensure convergence.
+- **Visual anchor injection**: Injects visual anchor tokens at critical moments of uncertain reasoning to reduce image-detached hallucinated reasoning.
+- **Plug-and-play**: Requires no additional training or external tools and can be directly applied to existing MLRMs.
 
 ---
 
-## 🛠️ 环境配置
+## 🛠️ Setup
 
-### 1. 克隆仓库
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/Zhongxing-XU/LEAD.git
 cd LEAD
 ```
 
-### 2. 安装依赖
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. 准备模型权重
+### 3. Prepare Model Weights
 
-下载 [R1-Onevision-7B](https://huggingface.co/Fancy-MLLM/R1-Onevision-7B)，或直接使用 HuggingFace 模型名自动下载：
+Download [R1-Onevision-7B](https://huggingface.co/Fancy-MLLM/R1-Onevision-7B), or use the Hugging Face model name for automatic download:
 
 ```bash
-# 方式 A：自动下载
+# Option A: automatic download
 --model_name Fancy-MLLM/R1-Onevision-7B
 
-# 方式 B：本地路径
+# Option B: local path
 --model_name /path/to/R1-Onevision-7B
 ```
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### Demo 示例
+### Demo Example
 
 ```bash
 python main.py \
@@ -76,13 +76,13 @@ python main.py \
     --max_new_tokens 2048
 ```
 
-### 完整评测
+### Full Evaluation
 
 ```bash
 bash script/run.sh
 ```
 
-### 自定义配置
+### Custom Configuration
 
 ```bash
 python main.py \
@@ -101,77 +101,77 @@ python main.py \
 
 ---
 
-## ⚙️ 参数说明
+## ⚙️ Arguments
 
-### 模型与数据
+### Model and Data
 
-| 参数 | 默认值 | 说明 |
+| Argument | Default | Description |
 |------|--------|------|
-| `--model_name` | `Fancy-MLLM/R1-Onevision-7B` | HuggingFace 模型名或本地权重路径 |
-| `--dataset` | `data/physunibench.jsonl` | 数据集 JSONL 文件路径 |
-| `--output_dir` | `output/` | 结果保存目录 |
-| `--limit` | `None` | 仅运行前 N 条样本（调试用） |
+| `--model_name` | `Fancy-MLLM/R1-Onevision-7B` | Hugging Face model name or local checkpoint path |
+| `--dataset` | `data/physunibench.jsonl` | Path to the dataset JSONL file |
+| `--output_dir` | `output/` | Directory for saving results |
+| `--limit` | `None` | Run only the first N samples (for debugging) |
 
-### 解码方法
+### Decoding Method
 
-| 参数 | 默认值 | 说明 |
+| Argument | Default | Description |
 |------|--------|------|
-| `--method` | `lead` | 解码方法：`lead` / `cot` / `cot_greedy` |
-| `--alpha` | `0.6` | Soft-mode 混合系数 α₀，越大越偏向概率加权 embedding |
-| `--max_switch_count` | `5` | 最大 soft→normal 模式切换次数，超出后触发收敛注入 |
+| `--method` | `lead` | Decoding method: `lead` / `cot` / `cot_greedy` |
+| `--alpha` | `0.6` | Soft-mode mixing coefficient α₀; larger values place more weight on probability-weighted embeddings |
+| `--max_switch_count` | `5` | Maximum number of soft→normal mode switches before convergence injection is triggered |
 
-### 采样参数
+### Sampling Parameters
 
-| 参数 | 默认值 | 说明 |
+| Argument | Default | Description |
 |------|--------|------|
-| `--temperature` | `0.6` | 采样温度 |
-| `--top_p` | `0.95` | Nucleus sampling 阈值 |
-| `--top_k` | `20` | Top-k 过滤 |
-| `--max_new_tokens` | `25600` | 最大生成 token 数 |
-| `--seed` | `42` | 随机种子 |
+| `--temperature` | `0.6` | Sampling temperature |
+| `--top_p` | `0.95` | Nucleus sampling threshold |
+| `--top_k` | `20` | Top-k filtering |
+| `--max_new_tokens` | `25600` | Maximum number of generated tokens |
+| `--seed` | `42` | Random seed |
 
 ---
 
-## 📁 可用脚本
+## 📁 Available Scripts
 
-| 脚本 | 说明 |
+| Script | Description |
 |------|------|
-| `script/run.sh` | LEAD 方法完整评测 |
-| `script/run_cot.sh` | CoT baseline 评测 |
-| `script/run_debug.sh` | 调试模式：5 条样本、短生成 |
-| `script/run_eval.sh` | 仅评估已有结果 |
+| `script/run.sh` | Full evaluation with the LEAD method |
+| `script/run_cot.sh` | Evaluation of the CoT baseline |
+| `script/run_debug.sh` | Debug mode: 5 samples with short generation |
+| `script/run_eval.sh` | Evaluate existing results only |
 
 ---
 
-## 📦 数据集格式
+## 📦 Dataset Format
 
-将 JSONL 文件放入 `data/` 目录，格式如下：
+Place the JSONL file in the `data/` directory using the following format:
 
 ```json
 {"id": 1, "image": "path/to/image.jpg", "question": "What is shown?", "options": "A. ...\nB. ...\nC. ...\nD. ...", "answer": "A"}
 ```
 
-内置 benchmark 数据集：`physunibench`、`math_vision`、`math_vista`、`mmvp`、`realworldqa`、`visulogic`、`vstar`、`demo`
+Built-in benchmark datasets: `physunibench`, `math_vision`, `math_vista`, `mmvp`, `realworldqa`, `visulogic`, `vstar`, `demo`
 
 ---
 
-## 🗂️ 项目结构
+## 🗂️ Project Structure
 
 ```
 LEAD/
-├── main.py                    # 主入口
+├── main.py                    # Main entry point
 ├── lead/
-│   ├── generation_utils.py    # LEAD 和 CoT 核心生成算法
-│   ├── inference.py           # 输入构造和单样本推理
-│   ├── data.py                # 数据加载与预处理
-│   ├── evaluator.py           # 答案评估与准确率统计
-│   ├── prompts.py             # Prompt 模板管理
-│   ├── logger.py              # 日志系统
-│   └── utils.py               # 通用工具函数
-├── data/                      # 数据集 JSONL 文件
-├── figure/                    # 论文图表
-├── script/                    # 运行脚本
-├── tests/                     # 单元测试
+│   ├── generation_utils.py    # Core generation algorithms for LEAD and CoT
+│   ├── inference.py           # Input construction and single-sample inference
+│   ├── data.py                # Data loading and preprocessing
+│   ├── evaluator.py           # Answer evaluation and accuracy statistics
+│   ├── prompts.py             # Prompt template management
+│   ├── logger.py              # Logging system
+│   └── utils.py               # General utility functions
+├── data/                      # Dataset JSONL files
+├── figure/                    # Paper figures
+├── script/                    # Run scripts
+├── tests/                     # Unit tests
 ├── requirements.txt
 ├── setup.py
 ├── LICENSE
@@ -180,9 +180,9 @@ LEAD/
 
 ---
 
-## 📝 引用
+## 📝 Citation
 
-如果本项目对你的研究有所帮助，请引用我们的论文：
+If this project is helpful to your research, please cite our paper:
 
 ```bibtex
 @inproceedings{xu2026lead,
@@ -197,4 +197,10 @@ LEAD/
 
 ## 📄 License
 
-本项目基于 MIT License 开源 — 详见 [LICENSE](LICENSE) 文件。
+This project is released under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## 💬 Acknowledgments
+
+We thank the contributors of open-source projects [Transformers](https://github.com/huggingface/transformers), [Qwen3](https://github.com/QwenLM/Qwen3), and [Soft-Thinking](https://github.com/eric-ai-lab/Soft-Thinking).
