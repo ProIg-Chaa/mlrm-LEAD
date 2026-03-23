@@ -52,14 +52,14 @@ pip install -r requirements.txt
 
 ### 3. Prepare Model Weights
 
-Download [R1-Onevision-7B](https://huggingface.co/Fancy-MLLM/R1-Onevision-7B), or use the Hugging Face model name for automatic download:
+Download [R1-Onevision-7B-RL](https://huggingface.co/Fancy-MLLM/R1-Onevision-7B-RL), or use the Hugging Face model name for automatic download:
 
 ```bash
 # Option A: automatic download
---model_name Fancy-MLLM/R1-Onevision-7B
+--model_name Fancy-MLLM/R1-Onevision-7B-RL
 
 # Option B: local path
---model_name /path/to/R1-Onevision-7B
+--model_name /path/to/R1-Onevision-7B-RL
 ```
 
 ---
@@ -70,7 +70,7 @@ Download [R1-Onevision-7B](https://huggingface.co/Fancy-MLLM/R1-Onevision-7B), o
 
 ```bash
 python main.py \
-    --model_name Fancy-MLLM/R1-Onevision-7B \
+    --model_name Fancy-MLLM/R1-Onevision-7B-RL \
     --dataset data/demo.jsonl \
     --method lead \
     --max_new_tokens 2048
@@ -86,7 +86,7 @@ bash script/run.sh
 
 ```bash
 python main.py \
-    --model_name Fancy-MLLM/R1-Onevision-7B \
+    --model_name Fancy-MLLM/R1-Onevision-7B-RL \
     --dataset data/physunibench.jsonl \
     --output_dir output \
     --method lead \
@@ -107,7 +107,7 @@ python main.py \
 
 | Argument | Default | Description |
 |------|--------|------|
-| `--model_name` | `Fancy-MLLM/R1-Onevision-7B` | Hugging Face model name or local checkpoint path |
+| `--model_name` | `Fancy-MLLM/R1-Onevision-7B-RL` | Hugging Face model name or local checkpoint path |
 | `--dataset` | `data/physunibench.jsonl` | Path to the dataset JSONL file |
 | `--output_dir` | `output/` | Directory for saving results |
 | `--limit` | `None` | Run only the first N samples (for debugging) |
