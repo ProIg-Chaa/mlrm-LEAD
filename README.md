@@ -2,7 +2,7 @@
 
 # LEAD: Latent Entropy-Aware Decoding
 
-### Thinking in Uncertainty: Mitigating Hallucinations in MLRMs with Latent Entropy-Aware Decoding
+### Thinking in Uncertainty: Mitigating Hallucinations in MLRMs // with Latent Entropy-Aware Decoding
 
 [![CVPR 2026](https://img.shields.io/badge/CVPR-2026-blue.svg)]()
 [![arXiv](https://img.shields.io/badge/arXiv-2603.13366-b31b1b.svg)](https://arxiv.org/abs/2603.13366)
