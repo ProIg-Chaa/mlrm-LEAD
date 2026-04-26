@@ -5,7 +5,9 @@ cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
 
 python3 script/prepare_mmhal_bench_jsonl.py
 
-RUN_DIR="output/experiments/mmhal_lead_paper_params_$(date +%Y%m%d_%H%M%S)"
+RUN_DATE="$(date +%Y%m%d)"
+RUN_NAME="mmhal_lead_paper_params_$(date +%H%M%S)"
+RUN_DIR="output/experiments/${RUN_DATE}/${RUN_NAME}"
 mkdir -p "$RUN_DIR"
 
 nohup env CUDA_VISIBLE_DEVICES=1 \
@@ -25,17 +27,17 @@ micromamba run -n mlrm-lead python main.py \
   --device cuda \
   --no-do_sample \
   --save_token_entropy \
-  > "$RUN_DIR.nohup.log" 2>&1 &
+  > "$RUN_DIR/nohup.log" 2>&1 &
 
 PID=$!
 
 echo "Started MMHal-Bench LEAD experiment"
 echo "PID: $PID"
 echo "Run dir: $RUN_DIR"
-echo "Log: $RUN_DIR.nohup.log"
+echo "Log: $RUN_DIR/nohup.log"
 echo
 echo "Watch progress:"
-echo "  tail -f $RUN_DIR.nohup.log"
+echo "  tail -f $RUN_DIR/nohup.log"
 echo
 echo "Summarize after completion:"
 echo "  bash script/summarize_latest_mmhal_lead_paper_params.sh"

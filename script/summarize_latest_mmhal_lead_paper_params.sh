@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
 
-RUN_DIR="$(ls -td output/experiments/mmhal_lead_paper_params_* 2>/dev/null | head -n 1)"
+RUN_DIR="$(
+  {
+    ls -td output/experiments/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/mmhal_lead_paper_params_* 2>/dev/null
+    ls -td output/experiments/mmhal_lead_paper_params_* 2>/dev/null
+  } | head -n 1
+)"
 
 if [[ -z "${RUN_DIR}" ]]; then
   echo "No MMHal-Bench LEAD paper-params experiment directory found." >&2

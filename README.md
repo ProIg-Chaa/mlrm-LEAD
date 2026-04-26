@@ -137,6 +137,15 @@ The MMHal-Bench script generates model responses and token-entropy summaries.
 MMHal hallucination scores should be computed separately with the official
 `eval_gpt4.py` evaluator, using the generated `mmhal_response.json`.
 
+New experiment outputs are organized by date:
+
+```text
+output/experiments/YYYYMMDD/experiment_name_HHMMSS/
+```
+
+Each experiment directory contains its own `config.json`, `results.jsonl`,
+`eval_report.json`, `token_entropy.jsonl`, logs, and any generated reports.
+
 ---
 
 ## ⚙️ Arguments

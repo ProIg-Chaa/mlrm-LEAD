@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
 
-RUN_DIR="$(ls -td output/experiments/vstar_lead_paper_params_* 2>/dev/null | head -n 1)"
+RUN_DIR="$(
+  {
+    ls -td output/experiments/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/vstar_lead_paper_params_* 2>/dev/null
+    ls -td output/experiments/vstar_lead_paper_params_* 2>/dev/null
+  } | head -n 1
+)"
 
 if [[ -z "${RUN_DIR}" ]]; then
   echo "No VStar LEAD paper-params experiment directory found." >&2
