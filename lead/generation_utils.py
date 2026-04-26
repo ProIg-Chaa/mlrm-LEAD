@@ -90,6 +90,7 @@ def generate_cot(model, tokenizer, **kwargs):
     do_sample       = kwargs.get("do_sample", True)
 
     stream_callback = kwargs.pop("stream_callback", None)
+    token_trace = kwargs.pop("token_trace", None)
 
     # ============================================
 
@@ -136,17 +137,35 @@ def generate_cot(model, tokenizer, **kwargs):
         cache_position = cache_position[-1:] + 1
 
         next_token_logits = outputs.logits[:, -1, :]  # [cur_batch, vocab]
+        raw_probs = F.softmax(next_token_logits, dim=-1)
+        raw_entropy = -(
+            raw_probs * raw_probs.clamp(min=1e-8).log()
+        ).sum(dim=-1)
         logits = next_token_logits / temperature
         logits = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)
 
         probs = F.softmax(logits, dim=-1)
+        filtered_entropy = -(
+            probs * probs.clamp(min=1e-8).log()
+        ).sum(dim=-1)
         if do_sample:
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
         else:
             next_tokens = torch.argmax(probs, dim=-1)
 
         for bi, orig in enumerate(unfinished_idx):
-            all_generated[orig].append(next_tokens[bi].item())
+            token_id = next_tokens[bi].item()
+            all_generated[orig].append(token_id)
+            if token_trace is not None:
+                token_trace.append({
+                    "step": int(step),
+                    "batch_index": int(orig),
+                    "token_id": int(token_id),
+                    "raw_entropy": float(raw_entropy[bi].item()),
+                    "filtered_entropy": float(filtered_entropy[bi].item()),
+                    "selected_prob": float(probs[bi, next_tokens[bi]].item()),
+                    "mode": "normal",
+                })
             if stream_callback is not None:
                 stream_callback(all_generated[orig][-1])
 
@@ -209,6 +228,7 @@ def generate_lead(model, tokenizer, **kwargs):
     termination_max_tokens = kwargs.pop("termination_max_tokens", 32)
 
     stream_callback       = kwargs.pop("stream_callback", None)
+    token_trace           = kwargs.pop("token_trace", None)
 
     # ============================================
 
@@ -298,6 +318,9 @@ def generate_lead(model, tokenizer, **kwargs):
         logits = logits_original / temperature  
         logits_filtered = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)  # [B, N, V]
         probs = F.softmax(logits_filtered, dim=-1)
+        filtered_entropy = -(
+            probs * probs.clamp(min=1e-8).log()
+        ).sum(dim=-1)
 
         if do_sample:
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -317,7 +340,7 @@ def generate_lead(model, tokenizer, **kwargs):
                                          device=device, dtype=torch.bool)
                 injecting[done_mask] = False
         
-        cur_entropy = -(probs_original * (probs_original.clamp(min=1e-12).log())).sum(dim=-1)
+        cur_entropy = -(probs_original * (probs_original.clamp(min=1e-8).log())).sum(dim=-1)
         if step == 0:
             cur_ref_entropy = cur_entropy.clone()
         else:
@@ -402,7 +425,20 @@ def generate_lead(model, tokenizer, **kwargs):
                 answer_budget = torch.where(active, answer_budget - 1, answer_budget)
 
         for bi, orig in enumerate(unfinished_idx):
-            all_generated[orig].append(next_tokens[bi].item())
+            token_id = next_tokens[bi].item()
+            all_generated[orig].append(token_id)
+            if token_trace is not None:
+                token_trace.append({
+                    "step": int(step),
+                    "batch_index": int(orig),
+                    "token_id": int(token_id),
+                    "raw_entropy": float(cur_entropy[bi].item()),
+                    "filtered_entropy": float(filtered_entropy[bi].item()),
+                    "selected_prob": float(probs[bi, next_tokens[bi]].item()),
+                    "mode": "soft" if bool(is_soft[bi].item()) else "normal",
+                    "alpha": float(alpha),
+                    "beta": float(beta),
+                })
             if stream_callback is not None:
                 stream_callback(all_generated[orig][-1])
         

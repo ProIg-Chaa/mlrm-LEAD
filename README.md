@@ -100,6 +100,43 @@ python main.py \
     --seed 42
 ```
 
+### Local Reproducibility Scripts
+
+This fork includes scripts used for local reproduction on the shared cluster.
+They assume the model and datasets are stored under
+`/share/home/wangzixu/liudinghao/gushuo/`.
+
+Download or verify model weights and datasets:
+
+```bash
+bash download_assets.sh
+```
+
+By default, the downloader uses `http://127.0.0.1:17991` as the proxy. To use
+another proxy:
+
+```bash
+PROXY_URL=http://127.0.0.1:8886 bash download_assets.sh
+```
+
+Run VStar with the paper-style LEAD parameters and token entropy logging:
+
+```bash
+bash script/run_vstar_lead_paper_params.sh
+bash script/summarize_latest_vstar_lead_paper_params.sh
+```
+
+Run MMHal-Bench with the same LEAD parameters and token entropy logging:
+
+```bash
+bash script/run_mmhal_lead_paper_params.sh
+bash script/summarize_latest_mmhal_lead_paper_params.sh
+```
+
+The MMHal-Bench script generates model responses and token-entropy summaries.
+MMHal hallucination scores should be computed separately with the official
+`eval_gpt4.py` evaluator, using the generated `mmhal_response.json`.
+
 ---
 
 ## ⚙️ Arguments
@@ -120,6 +157,8 @@ python main.py \
 | `--method` | `lead` | Decoding method: `lead` / `cot` / `cot_greedy` |
 | `--alpha` | `0.6` | Soft-mode mixing coefficient α₀; larger values place more weight on probability-weighted embeddings |
 | `--max_switch_count` | `5` | Maximum number of soft→normal mode switches before convergence injection is triggered |
+| `--window_size` | `256` | Minimum duration before switching from discrete mode back to latent mode |
+| `--save_token_entropy` | `False` | Save compact per-sample token entropy summaries to `token_entropy.jsonl` |
 
 ### Sampling Parameters
 
@@ -141,6 +180,14 @@ python main.py \
 | `script/run_cot.sh` | Evaluation of the CoT baseline |
 | `script/run_debug.sh` | Debug mode: 5 samples with short generation |
 | `script/run_eval.sh` | Evaluate existing results only |
+| `script/run_method_comparison.py` | Run `cot`, `cot_greedy`, and/or `lead` and write a comparison report |
+| `script/summarize_token_entropy.py` | Aggregate compact token entropy summaries |
+| `script/run_vstar_lead_paper_params.sh` | Run full VStar with `alpha=0.4`, `max_switch_count=5`, `window_size=128`, greedy decoding, and entropy logging |
+| `script/summarize_latest_vstar_lead_paper_params.sh` | Summarize the latest VStar paper-parameter run |
+| `script/prepare_mmhal_bench_jsonl.py` | Convert downloaded MMHal-Bench files to project JSONL format |
+| `script/run_mmhal_lead_paper_params.sh` | Run MMHal-Bench with the same LEAD paper-style parameters and entropy logging |
+| `script/summarize_latest_mmhal_lead_paper_params.sh` | Summarize the latest MMHal-Bench run and export `mmhal_response.json` |
+| `download_assets.sh` | Download or verify model weights and datasets used by the local experiments |
 
 ---
 
@@ -152,7 +199,39 @@ Place the JSONL file in the `data/` directory using the following format:
 {"id": 1, "image": "path/to/image.jpg", "question": "What is shown?", "options": "A. ...\nB. ...\nC. ...\nD. ...", "answer": "A"}
 ```
 
-Built-in benchmark datasets: `physunibench`, `math_vision`, `math_vista`, `mmvp`, `realworldqa`, `visulogic`, `vstar`, `demo`
+Built-in benchmark datasets: `physunibench`, `math_vision`, `math_vista`,
+`mmvp`, `realworldqa`, `visulogic`, `vstar`, `mmhal_bench`, `demo`
+
+For MMHal-Bench, run:
+
+```bash
+python3 script/prepare_mmhal_bench_jsonl.py
+```
+
+The generated `data/mmhal_bench.jsonl` is used for model response generation
+and entropy analysis. Final MMHal hallucination scoring still requires the
+official GPT-based evaluator.
+
+---
+
+## 🔬 Entropy Logging
+
+When `--save_token_entropy` is enabled, each sample writes a compact record to
+`token_entropy.jsonl`. The summary includes:
+
+- full-output raw and filtered entropy statistics
+- `<think>...</think>` reasoning-region entropy statistics
+- LEAD soft-token counts and ratios
+- reasoning-relation token statistics for markers such as `therefore`,
+  `however`, `because`, `so`, `then`, `if`, `given`, and `implies`
+- relation-category entropy summaries for conclusion, contrast,
+  causal/conditional, sequence, and result markers
+
+Aggregate a saved entropy file with:
+
+```bash
+python3 script/summarize_token_entropy.py output/path/token_entropy.jsonl
+```
 
 ---
 
@@ -170,8 +249,10 @@ LEAD/
 │   ├── logger.py              # Logging system
 │   └── utils.py               # General utility functions
 ├── data/                      # Dataset JSONL files
+├── result/                    # Local experiment notes and reports
 ├── figure/                    # Paper figures
 ├── script/                    # Run scripts
+├── download_assets.sh          # Local asset downloader
 ├── tests/                     # Unit tests
 ├── requirements.txt
 ├── setup.py

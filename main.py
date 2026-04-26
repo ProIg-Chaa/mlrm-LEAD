@@ -11,7 +11,9 @@ PhysUniBench 评测主入口。
 """
 
 import argparse
+import json
 import os
+import re
 
 import torch
 from transformers import (
@@ -33,6 +35,292 @@ from lead import (
     save_json,
     Timer,
 )
+
+
+def percentile(values, q):
+    """Return a simple percentile from an in-memory list."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = round((len(ordered) - 1) * q)
+    return ordered[index]
+
+
+def entropy_stats(values):
+    """Compact entropy statistics for a list of scalar values."""
+    if not values:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p90": None,
+            "max": None,
+            "high_gt_1_ratio": None,
+            "high_gt_2_ratio": None,
+        }
+    ordered = sorted(values)
+    count = len(ordered)
+    return {
+        "count": count,
+        "mean": sum(ordered) / count,
+        "median": percentile(ordered, 0.5),
+        "p90": percentile(ordered, 0.9),
+        "max": ordered[-1],
+        "high_gt_1_ratio": sum(v > 1.0 for v in ordered) / count,
+        "high_gt_2_ratio": sum(v > 2.0 for v in ordered) / count,
+    }
+
+
+RELATION_MARKER_CATEGORIES = {
+    "conclusion": {
+        "therefore",
+        "thus",
+        "hence",
+        "consequently",
+        "accordingly",
+    },
+    "contrast": {
+        "however",
+        "but",
+        "although",
+        "though",
+        "instead",
+        "while",
+        "whereas",
+    },
+    "causal_condition": {
+        "because",
+        "since",
+        "so",
+        "if",
+        "when",
+        "as",
+        "given",
+        "assuming",
+        "implies",
+        "means",
+    },
+    "sequence": {
+        "then",
+        "first",
+        "second",
+        "third",
+        "next",
+        "finally",
+        "now",
+        "also",
+        "moreover",
+        "furthermore",
+    },
+    "result": {
+        "result",
+        "results",
+        "resulting",
+        "thereby",
+    },
+}
+RELATION_MARKERS = set().union(*RELATION_MARKER_CATEGORIES.values())
+
+
+def normalize_token_text(text):
+    """Normalize a decoded single-token text for relation-marker matching."""
+    normalized = text.strip().lower()
+    normalized = re.sub(r"^[^a-z]+|[^a-z]+$", "", normalized)
+    return normalized
+
+
+def build_entropy_summary(tokenizer, trace):
+    """Build compact entropy stats, with robust <think> span detection."""
+    if not trace:
+        return {
+            "token_count": 0,
+            "think_opened": False,
+            "think_closed": False,
+            "reasoning_token_count": 0,
+            "reasoning_token_ratio": None,
+            "all_raw_entropy": entropy_stats([]),
+            "reasoning_raw_entropy": entropy_stats([]),
+            "non_reasoning_raw_entropy": entropy_stats([]),
+            "all_filtered_entropy": entropy_stats([]),
+            "reasoning_filtered_entropy": entropy_stats([]),
+            "non_reasoning_filtered_entropy": entropy_stats([]),
+            "soft_token_count": 0,
+            "soft_ratio": None,
+            "reasoning_soft_token_count": 0,
+            "reasoning_soft_ratio": None,
+            "relation_token_count": 0,
+            "relation_token_ratio": None,
+            "reasoning_relation_token_count": 0,
+            "reasoning_relation_token_ratio": None,
+            "relation_raw_entropy": entropy_stats([]),
+            "non_relation_raw_entropy": entropy_stats([]),
+            "reasoning_relation_raw_entropy": entropy_stats([]),
+            "reasoning_non_relation_raw_entropy": entropy_stats([]),
+            "relation_filtered_entropy": entropy_stats([]),
+            "reasoning_relation_filtered_entropy": entropy_stats([]),
+            "relation_marker_counts": {},
+            "relation_category_stats": {},
+        }
+
+    token_texts = [
+        tokenizer.decode(
+            [token["token_id"]],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        for token in trace
+    ]
+    spans = []
+    full_text = ""
+    for text in token_texts:
+        start = len(full_text)
+        full_text += text
+        spans.append((start, len(full_text)))
+
+    think_start = full_text.find("<think>")
+    think_end = full_text.find("</think>", think_start + 1) if think_start >= 0 else -1
+    reasoning_start = think_start if think_start >= 0 else None
+    reasoning_end = (
+        think_end + len("</think>")
+        if think_end >= 0
+        else len(full_text) if think_start >= 0 else None
+    )
+
+    all_raw = []
+    reasoning_raw = []
+    non_reasoning_raw = []
+    all_filtered = []
+    reasoning_filtered = []
+    non_reasoning_filtered = []
+    soft_token_count = 0
+    reasoning_soft_token_count = 0
+    reasoning_token_count = 0
+    relation_token_count = 0
+    reasoning_relation_token_count = 0
+    relation_raw = []
+    non_relation_raw = []
+    reasoning_relation_raw = []
+    reasoning_non_relation_raw = []
+    relation_filtered = []
+    reasoning_relation_filtered = []
+    relation_marker_counts = {}
+    relation_category_raw = {
+        category: [] for category in RELATION_MARKER_CATEGORIES
+    }
+
+    for token, token_text, (start, end) in zip(trace, token_texts, spans):
+        is_reasoning = (
+            reasoning_start is not None
+            and reasoning_end is not None
+            and end > reasoning_start
+            and start < reasoning_end
+        )
+        normalized_text = normalize_token_text(token_text)
+        relation_category = None
+        for category, markers in RELATION_MARKER_CATEGORIES.items():
+            if normalized_text in markers:
+                relation_category = category
+                break
+        is_relation_marker = relation_category is not None
+
+        is_soft = token.get("mode") == "soft"
+        if is_reasoning:
+            reasoning_token_count += 1
+        if is_relation_marker:
+            relation_token_count += 1
+            relation_marker_counts[normalized_text] = (
+                relation_marker_counts.get(normalized_text, 0) + 1
+            )
+            if is_reasoning:
+                reasoning_relation_token_count += 1
+        if is_soft:
+            soft_token_count += 1
+            if is_reasoning:
+                reasoning_soft_token_count += 1
+
+        raw_entropy = token.get("raw_entropy")
+        if raw_entropy is not None:
+            raw_entropy = float(raw_entropy)
+            all_raw.append(raw_entropy)
+            if is_reasoning:
+                reasoning_raw.append(raw_entropy)
+            else:
+                non_reasoning_raw.append(raw_entropy)
+            if is_relation_marker:
+                relation_raw.append(raw_entropy)
+                relation_category_raw[relation_category].append(raw_entropy)
+                if is_reasoning:
+                    reasoning_relation_raw.append(raw_entropy)
+            else:
+                non_relation_raw.append(raw_entropy)
+                if is_reasoning:
+                    reasoning_non_relation_raw.append(raw_entropy)
+
+        filtered_entropy = token.get("filtered_entropy")
+        if filtered_entropy is not None:
+            filtered_entropy = float(filtered_entropy)
+            all_filtered.append(filtered_entropy)
+            if is_reasoning:
+                reasoning_filtered.append(filtered_entropy)
+            else:
+                non_reasoning_filtered.append(filtered_entropy)
+            if is_relation_marker:
+                relation_filtered.append(filtered_entropy)
+                if is_reasoning:
+                    reasoning_relation_filtered.append(filtered_entropy)
+
+    token_count = len(trace)
+    return {
+        "token_count": token_count,
+        "think_opened": think_start >= 0,
+        "think_closed": think_end >= 0,
+        "reasoning_token_count": reasoning_token_count,
+        "reasoning_token_ratio": (
+            reasoning_token_count / token_count if token_count else None
+        ),
+        "all_raw_entropy": entropy_stats(all_raw),
+        "reasoning_raw_entropy": entropy_stats(reasoning_raw),
+        "non_reasoning_raw_entropy": entropy_stats(non_reasoning_raw),
+        "all_filtered_entropy": entropy_stats(all_filtered),
+        "reasoning_filtered_entropy": entropy_stats(reasoning_filtered),
+        "non_reasoning_filtered_entropy": entropy_stats(non_reasoning_filtered),
+        "soft_token_count": soft_token_count,
+        "soft_ratio": soft_token_count / token_count if token_count else None,
+        "reasoning_soft_token_count": reasoning_soft_token_count,
+        "reasoning_soft_ratio": (
+            reasoning_soft_token_count / reasoning_token_count
+            if reasoning_token_count
+            else None
+        ),
+        "relation_token_count": relation_token_count,
+        "relation_token_ratio": relation_token_count / token_count if token_count else None,
+        "reasoning_relation_token_count": reasoning_relation_token_count,
+        "reasoning_relation_token_ratio": (
+            reasoning_relation_token_count / reasoning_token_count
+            if reasoning_token_count
+            else None
+        ),
+        "relation_raw_entropy": entropy_stats(relation_raw),
+        "non_relation_raw_entropy": entropy_stats(non_relation_raw),
+        "reasoning_relation_raw_entropy": entropy_stats(reasoning_relation_raw),
+        "reasoning_non_relation_raw_entropy": entropy_stats(
+            reasoning_non_relation_raw
+        ),
+        "relation_filtered_entropy": entropy_stats(relation_filtered),
+        "reasoning_relation_filtered_entropy": entropy_stats(
+            reasoning_relation_filtered
+        ),
+        "relation_marker_counts": dict(
+            sorted(
+                relation_marker_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ),
+        "relation_category_stats": {
+            category: entropy_stats(values)
+            for category, values in relation_category_raw.items()
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +400,13 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD alpha_0 参数")
     parser.add_argument("--max_switch_count", type=int, default=5,
                         help="LEAD 最大切换次数")
+    parser.add_argument("--window_size", type=int, default=256,
+                        help="LEAD 离散到潜在模式切换的最小持续步数")
+    parser.add_argument(
+        "--save_token_entropy",
+        action="store_true",
+        help="保存每个生成 token 的熵轨迹到 token_entropy.jsonl",
+    )
 
     # ---- 采样参数 ----
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -199,6 +494,7 @@ def main():
     dataset_path = args.dataset or os.path.join(data_dir, "physunibench.jsonl")
     output_path = os.path.join(output_dir, "results.jsonl")
     report_path = os.path.join(output_dir, "eval_report.json")
+    token_entropy_path = os.path.join(output_dir, "token_entropy.jsonl")
 
     # ---- 加载模型（仅加载一次） ----
     logger.info(f"Loading model: {args.model_name}")
@@ -239,6 +535,7 @@ def main():
         "method": args.method,
         "alpha": args.alpha,
         "max_switch_count": args.max_switch_count,
+        "window_size": args.window_size,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -246,7 +543,10 @@ def main():
         "seed": args.seed,
         "dataset": dataset_path,
         "num_samples": len(dataset),
+        "save_token_entropy": args.save_token_entropy,
     }
+    if args.save_token_entropy:
+        config["token_entropy_path"] = token_entropy_path
     save_json(config, os.path.join(output_dir, "config.json"))
 
     # ---- 逐样本推理 ----
@@ -254,7 +554,10 @@ def main():
     total_timer = Timer("total_inference").start()
 
     for idx, sample in enumerate(dataset):
-        prompt = format_prompt_from_sample(sample)
+        prompt = format_prompt_from_sample(
+            sample,
+            use_cot=args.method in {"cot", "cot_greedy"},
+        )
         image_url = sample.get("image", "")
 
         logger.info(f"[{idx + 1}/{len(dataset)}] id={sample.get('id', '?')} "
@@ -263,6 +566,11 @@ def main():
         args.image = image_url
         args.prompt = prompt
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        args.token_entropy_trace = None
+        args.prompt_tokens = None
         with Timer("sample") as sample_timer:
             try:
                 sample["model_answer"] = run_single_inference(
@@ -271,8 +579,40 @@ def main():
             except Exception as e:
                 logger.warning(f"Sample {idx} failed: {e}")
                 sample["model_answer"] = None
+                sample["error_type"] = type(e).__name__
+                sample["error_message"] = str(e)
                 torch.cuda.empty_cache()
-                continue
+
+        sample["latency_sec"] = sample_timer.elapsed
+        sample.setdefault("error_type", None)
+        sample.setdefault("error_message", None)
+        if sample.get("model_answer") is not None:
+            sample["output_tokens"] = len(
+                tokenizer.encode(sample["model_answer"], add_special_tokens=False)
+            )
+        if torch.cuda.is_available():
+            sample["cuda_peak_allocated_mb"] = (
+                torch.cuda.max_memory_allocated() / 1024 / 1024
+            )
+            sample["cuda_peak_reserved_mb"] = (
+                torch.cuda.max_memory_reserved() / 1024 / 1024
+            )
+        if args.save_token_entropy:
+            trace_record = {
+                "sample_index": idx,
+                "id": sample.get("id"),
+                "method": args.method,
+                "answer": sample.get("answer"),
+                "prompt_tokens": args.prompt_tokens,
+                "output_tokens": sample.get("output_tokens"),
+                "error_type": sample.get("error_type"),
+                "entropy_summary": build_entropy_summary(
+                    tokenizer,
+                    args.token_entropy_trace or [],
+                ),
+            }
+            with open(token_entropy_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(trace_record, ensure_ascii=False) + "\n")
 
         logger.info(f"  Completed in {sample_timer}")
 

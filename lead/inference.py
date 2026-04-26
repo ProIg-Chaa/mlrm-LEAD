@@ -41,6 +41,12 @@ def prepare_inputs(
         tokenize=False,
         add_generation_prompt=True,
     )
+    if "<|image_pad|>" not in chat_text:
+        chat_text = chat_text.replace(
+            "<|im_start|>user\n",
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>",
+            1,
+        )
     image_inputs, video_inputs = process_vision_info(messages)
     encoded = processor(
         text=[chat_text],
@@ -88,8 +94,13 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
     ]
 
     model_inputs = prepare_inputs(processor, messages, device)
+    prompt_len = model_inputs["input_ids"].shape[1]
+    args.prompt_tokens = int(prompt_len)
+    args.token_entropy_trace = (
+        [] if getattr(args, "save_token_entropy", False) else None
+    )
 
-    print("input_ids len:", model_inputs["input_ids"].shape[1])
+    print("input_ids len:", prompt_len)
     if "image_grid_thw" in model_inputs:
         thw = model_inputs["image_grid_thw"]
         print("image_grid_thw:", thw.tolist())
@@ -111,6 +122,8 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
         "max_new_tokens": args.max_new_tokens,
         "do_sample": args.do_sample,
     }
+    if args.token_entropy_trace is not None:
+        gen_kwargs["token_trace"] = args.token_entropy_trace
 
     if args.method == "cot_greedy":
         gen_kwargs["do_sample"] = False
@@ -121,6 +134,7 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
                 model_inputs["math_ids_tensor"] = math_ids_tensor
             model_inputs["alpha_0"] = args.alpha
             model_inputs["max_switch_count"] = args.max_switch_count
+            model_inputs["window_size"] = args.window_size
             model_inputs["convergence_words"] = "</think>"
             outputs = generate_lead(
                 model,
@@ -136,7 +150,6 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
                 **gen_kwargs,
             )
 
-    prompt_len = model_inputs["input_ids"].shape[1]
     generated_text = tokenizer.decode(
         outputs[0][prompt_len:],
         skip_special_tokens=True,
