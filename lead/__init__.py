@@ -18,6 +18,7 @@ from .generation_utils import (
     get_math_symbols_ids,
     generate_cot,
     generate_lead,
+    generate_lead_attenachor,
     apply_sampling_filter,
 )
 from .inference import prepare_inputs, run_single_inference

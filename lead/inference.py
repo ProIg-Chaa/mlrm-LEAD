@@ -17,6 +17,7 @@ from .generation_utils import (
     get_math_symbols_ids,
     generate_cot,
     generate_lead,
+    generate_lead_attenachor,
 )
 
 
@@ -137,6 +138,20 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["window_size"] = args.window_size
             model_inputs["convergence_words"] = "</think>"
             outputs = generate_lead(
+                model,
+                tokenizer,
+                **model_inputs,
+                **gen_kwargs,
+            )
+        elif args.method in {"lead_attenachor", "lead_attenanchor"}:
+            if math_ids_tensor is not None:
+                model_inputs["math_ids_tensor"] = math_ids_tensor
+            model_inputs["alpha_0"] = args.alpha
+            model_inputs["max_switch_count"] = args.max_switch_count
+            model_inputs["window_size"] = args.window_size
+            model_inputs["convergence_words"] = "</think>"
+            model_inputs["visual_anchor_top_m"] = args.visual_anchor_top_m
+            outputs = generate_lead_attenachor(
                 model,
                 tokenizer,
                 **model_inputs,

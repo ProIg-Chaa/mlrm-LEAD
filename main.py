@@ -129,6 +129,61 @@ def normalize_token_text(text):
     return normalized
 
 
+def annotate_token_trace(tokenizer, trace):
+    """Annotate per-token traces with decoded text and reasoning/relation flags."""
+    if not trace:
+        return []
+
+    token_texts = [
+        tokenizer.decode(
+            [token["token_id"]],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        for token in trace
+    ]
+    spans = []
+    full_text = ""
+    for text in token_texts:
+        start = len(full_text)
+        full_text += text
+        spans.append((start, len(full_text)))
+
+    think_start = full_text.find("<think>")
+    think_end = full_text.find("</think>", think_start + 1) if think_start >= 0 else -1
+    reasoning_start = think_start if think_start >= 0 else None
+    reasoning_end = (
+        think_end + len("</think>")
+        if think_end >= 0
+        else len(full_text) if think_start >= 0 else None
+    )
+
+    annotated = []
+    for token, token_text, (start, end) in zip(trace, token_texts, spans):
+        is_reasoning = (
+            reasoning_start is not None
+            and reasoning_end is not None
+            and end > reasoning_start
+            and start < reasoning_end
+        )
+        normalized_text = normalize_token_text(token_text)
+        relation_category = None
+        for category, markers in RELATION_MARKER_CATEGORIES.items():
+            if normalized_text in markers:
+                relation_category = category
+                break
+
+        annotated_token = dict(token)
+        annotated_token["token_text"] = token_text
+        annotated_token["normalized_token_text"] = normalized_text
+        annotated_token["is_reasoning_token"] = is_reasoning
+        annotated_token["is_relation_token"] = relation_category is not None
+        annotated_token["relation_category"] = relation_category
+        annotated.append(annotated_token)
+
+    return annotated
+
+
 def build_entropy_summary(tokenizer, trace):
     """Build compact entropy stats, with robust <think> span detection."""
     if not trace:
@@ -162,29 +217,9 @@ def build_entropy_summary(tokenizer, trace):
             "relation_category_stats": {},
         }
 
-    token_texts = [
-        tokenizer.decode(
-            [token["token_id"]],
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        for token in trace
-    ]
-    spans = []
-    full_text = ""
-    for text in token_texts:
-        start = len(full_text)
-        full_text += text
-        spans.append((start, len(full_text)))
-
-    think_start = full_text.find("<think>")
-    think_end = full_text.find("</think>", think_start + 1) if think_start >= 0 else -1
-    reasoning_start = think_start if think_start >= 0 else None
-    reasoning_end = (
-        think_end + len("</think>")
-        if think_end >= 0
-        else len(full_text) if think_start >= 0 else None
-    )
+    annotated_trace = annotate_token_trace(tokenizer, trace)
+    think_start = any(token["token_text"] == "<think>" for token in annotated_trace)
+    think_closed = any("</think>" in token["token_text"] for token in annotated_trace)
 
     all_raw = []
     reasoning_raw = []
@@ -208,20 +243,11 @@ def build_entropy_summary(tokenizer, trace):
         category: [] for category in RELATION_MARKER_CATEGORIES
     }
 
-    for token, token_text, (start, end) in zip(trace, token_texts, spans):
-        is_reasoning = (
-            reasoning_start is not None
-            and reasoning_end is not None
-            and end > reasoning_start
-            and start < reasoning_end
-        )
-        normalized_text = normalize_token_text(token_text)
-        relation_category = None
-        for category, markers in RELATION_MARKER_CATEGORIES.items():
-            if normalized_text in markers:
-                relation_category = category
-                break
-        is_relation_marker = relation_category is not None
+    for token in annotated_trace:
+        is_reasoning = token["is_reasoning_token"]
+        normalized_text = token["normalized_token_text"]
+        relation_category = token["relation_category"]
+        is_relation_marker = token["is_relation_token"]
 
         is_soft = token.get("mode") == "soft"
         if is_reasoning:
@@ -272,8 +298,8 @@ def build_entropy_summary(tokenizer, trace):
     token_count = len(trace)
     return {
         "token_count": token_count,
-        "think_opened": think_start >= 0,
-        "think_closed": think_end >= 0,
+        "think_opened": think_start,
+        "think_closed": think_closed,
         "reasoning_token_count": reasoning_token_count,
         "reasoning_token_ratio": (
             reasoning_token_count / token_count if token_count else None
@@ -393,8 +419,8 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="lead",
-        choices=["lead", "cot", "cot_greedy"],
-        help="推理方法：lead / cot / cot_greedy",
+        choices=["lead", "lead_attenachor", "lead_attenanchor", "cot", "cot_greedy"],
+        help="推理方法：lead / lead_attenachor / cot / cot_greedy",
     )
     parser.add_argument("--alpha", type=float, default=0.6,
                         help="LEAD alpha_0 参数")
@@ -402,10 +428,17 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 最大切换次数")
     parser.add_argument("--window_size", type=int, default=256,
                         help="LEAD 离散到潜在模式切换的最小持续步数")
+    parser.add_argument("--visual_anchor_top_m", type=int, default=32,
+                        help="lead_attenachor 中按当前 token 对视觉 token attention 选取的 top-m")
     parser.add_argument(
         "--save_token_entropy",
         action="store_true",
         help="保存每个生成 token 的熵轨迹到 token_entropy.jsonl",
+    )
+    parser.add_argument(
+        "--save_full_token_entropy",
+        action="store_true",
+        help="保存完整逐 token 熵轨迹到 token_entropy_full.jsonl，便于画曲线",
     )
 
     # ---- 采样参数 ----
@@ -495,14 +528,28 @@ def main():
     output_path = os.path.join(output_dir, "results.jsonl")
     report_path = os.path.join(output_dir, "eval_report.json")
     token_entropy_path = os.path.join(output_dir, "token_entropy.jsonl")
+    full_token_entropy_path = os.path.join(output_dir, "token_entropy_full.jsonl")
 
     # ---- 加载模型（仅加载一次） ----
     logger.info(f"Loading model: {args.model_name}")
     with Timer("model_loading") as t:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            args.model_name,
-            device_map="auto",
-        )
+        model_load_kwargs = {}
+        if args.method in {"lead_attenachor", "lead_attenanchor"}:
+            if args.device == "auto":
+                model_device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                model_device = args.device
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.model_name,
+                **model_load_kwargs,
+            )
+            model = model.to(model_device)
+        else:
+            model_load_kwargs["device_map"] = "auto"
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.model_name,
+                **model_load_kwargs,
+            )
         processor = AutoProcessor.from_pretrained(args.model_name)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         tokenizer.padding_side = "left"
@@ -536,6 +583,7 @@ def main():
         "alpha": args.alpha,
         "max_switch_count": args.max_switch_count,
         "window_size": args.window_size,
+        "visual_anchor_top_m": args.visual_anchor_top_m,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -544,9 +592,12 @@ def main():
         "dataset": dataset_path,
         "num_samples": len(dataset),
         "save_token_entropy": args.save_token_entropy,
+        "save_full_token_entropy": args.save_full_token_entropy,
     }
     if args.save_token_entropy:
         config["token_entropy_path"] = token_entropy_path
+    if args.save_full_token_entropy:
+        config["full_token_entropy_path"] = full_token_entropy_path
     save_json(config, os.path.join(output_dir, "config.json"))
 
     # ---- 逐样本推理 ----
@@ -598,6 +649,7 @@ def main():
                 torch.cuda.max_memory_reserved() / 1024 / 1024
             )
         if args.save_token_entropy:
+            token_trace = args.token_entropy_trace or []
             trace_record = {
                 "sample_index": idx,
                 "id": sample.get("id"),
@@ -608,11 +660,24 @@ def main():
                 "error_type": sample.get("error_type"),
                 "entropy_summary": build_entropy_summary(
                     tokenizer,
-                    args.token_entropy_trace or [],
+                    token_trace,
                 ),
             }
             with open(token_entropy_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(trace_record, ensure_ascii=False) + "\n")
+            if args.save_full_token_entropy:
+                full_record = {
+                    "sample_index": idx,
+                    "id": sample.get("id"),
+                    "method": args.method,
+                    "answer": sample.get("answer"),
+                    "prompt_tokens": args.prompt_tokens,
+                    "output_tokens": sample.get("output_tokens"),
+                    "error_type": sample.get("error_type"),
+                    "tokens": annotate_token_trace(tokenizer, token_trace),
+                }
+                with open(full_token_entropy_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(full_record, ensure_ascii=False) + "\n")
 
         logger.info(f"  Completed in {sample_timer}")
 
