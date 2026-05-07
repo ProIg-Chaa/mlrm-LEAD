@@ -196,6 +196,130 @@ def generate_cot(model, tokenizer, **kwargs):
     return out
 
 
+def generate_pure_soft(model, tokenizer, **kwargs):
+    """Generate with probability-weighted token embeddings at every decode step."""
+    input_ids = kwargs.pop("input_ids")
+    attention_mask = kwargs.pop("attention_mask")
+    vision_inputs = {}
+    for key in list(kwargs.keys()):
+        if any(tag in key for tag in ("pixel", "image", "video")):
+            value = kwargs.pop(key)
+            if value is not None:
+                vision_inputs[key] = value
+
+    temperature = kwargs.get("temperature", 1.0)
+    top_p = kwargs.get("top_p", 1.0)
+    top_k = kwargs.get("top_k", 0)
+    min_p = kwargs.get("min_p", 0)
+    max_new_tokens = kwargs.get("max_new_tokens", 32768)
+    do_sample = kwargs.get("do_sample", True)
+
+    stream_callback = kwargs.pop("stream_callback", None)
+    token_trace = kwargs.pop("token_trace", None)
+
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+    batch_size, device = input_ids.shape[0], input_ids.device
+    E = model.get_input_embeddings().weight
+    all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
+    unfinished_idx = list(range(batch_size))
+    past_key_values = None
+    cache_position = torch.arange(input_ids.shape[1], device=device, dtype=torch.long)
+    last_emb = None
+
+    for step in range(max_new_tokens):
+        cur_batch = attention_mask.shape[0]
+        if cur_batch == 0:
+            break
+
+        if past_key_values is None:
+            model_inputs = {"input_ids": input_ids.clone()}
+            if attention_mask is not None:
+                model_inputs["attention_mask"] = attention_mask
+            if vision_inputs:
+                model_inputs.update(vision_inputs)
+            model_inputs["cache_position"] = cache_position
+        else:
+            attention_mask_new = torch.ones((cur_batch, 1), dtype=attention_mask.dtype, device=device)
+            attention_mask = torch.cat([attention_mask, attention_mask_new], dim=1)
+            model_inputs = {
+                "inputs_embeds": last_emb.unsqueeze(1),
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "cache_position": cache_position,
+            }
+
+        with torch.no_grad():
+            outputs = model(**model_inputs, use_cache=True)
+        past_key_values = outputs.past_key_values
+        if vision_inputs:
+            vision_inputs = {}
+        cache_position = cache_position[-1:] + 1
+
+        logits_original = outputs.logits[:, -1, :]
+        probs_original = F.softmax(logits_original, dim=-1)
+        raw_entropy = -(
+            probs_original * probs_original.clamp(min=1e-8).log()
+        ).sum(dim=-1)
+
+        logits = logits_original / temperature
+        logits_filtered = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)
+        probs = F.softmax(logits_filtered, dim=-1)
+        filtered_entropy = -(
+            probs * probs.clamp(min=1e-8).log()
+        ).sum(dim=-1)
+
+        if do_sample:
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        else:
+            next_tokens = torch.argmax(probs, dim=-1)
+
+        selected_prob = probs[torch.arange(cur_batch, device=device), next_tokens]
+        raw_selected_prob = probs_original[torch.arange(cur_batch, device=device), next_tokens]
+        last_emb = torch.matmul(probs_original, E)
+
+        for bi, orig in enumerate(unfinished_idx):
+            token_id = next_tokens[bi].item()
+            all_generated[orig].append(token_id)
+            if token_trace is not None:
+                token_trace.append({
+                    "step": int(step),
+                    "batch_index": int(orig),
+                    "token_id": int(token_id),
+                    "raw_entropy": float(raw_entropy[bi].item()),
+                    "filtered_entropy": float(filtered_entropy[bi].item()),
+                    "selected_prob": float(selected_prob[bi].item()),
+                    "raw_selected_prob": float(raw_selected_prob[bi].item()),
+                    "confidence": float(selected_prob[bi].item()),
+                    "mode": "pure_soft",
+                })
+            if stream_callback is not None:
+                stream_callback(all_generated[orig][-1])
+
+        if tokenizer.eos_token_id is not None:
+            cur_finished = (next_tokens == tokenizer.eos_token_id)
+        else:
+            cur_finished = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+
+        keep_idx = (~cur_finished).nonzero(as_tuple=False).squeeze(-1)
+        unfinished_idx = [unfinished_idx[i] for i in keep_idx.tolist()]
+        if len(unfinished_idx) == 0:
+            break
+
+        last_emb = last_emb[keep_idx]
+        attention_mask = attention_mask[keep_idx]
+        keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
+        if hasattr(past_key_values, "batch_select_indices"):
+            past_key_values.batch_select_indices(keep_idx_tensor)
+
+    maxlen = max(len(g) for g in all_generated)
+    out = torch.full((batch_size, maxlen), tokenizer.pad_token_id or 0, dtype=torch.long, device=device)
+    for i, ids in enumerate(all_generated):
+        out[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+    return out
+
+
 def generate_lead(model, tokenizer, **kwargs):
 
     # ---- **model_inputs ----
@@ -513,6 +637,7 @@ def _compute_dynamic_visual_anchor(
     visual_token_mask,
     prompt_len,
     top_m,
+    attn_last_k,
 ):
     """
     Select top-m visual tokens from current-token attention, then pool them with
@@ -534,6 +659,9 @@ def _compute_dynamic_visual_anchor(
         )
 
     layer_views = []
+    if attn_last_k is not None and int(attn_last_k) > 0:
+        attn_layers = attn_layers[-int(attn_last_k):]
+
     for layer_attn in attn_layers:
         if layer_attn is None:
             continue
@@ -546,7 +674,7 @@ def _compute_dynamic_visual_anchor(
     if not layer_views:
         raise RuntimeError("No usable attention layers found in outputs.attentions.")
 
-    # Aggregate only the final few decoder layers, then mean over layers.
+    # Aggregate selected decoder layers, then mean over layers.
     current_attn = torch.stack(layer_views, dim=0).mean(dim=0)
     kv_len = current_attn.shape[-1]
     prompt_key_len = min(prompt_len, kv_len)
@@ -634,6 +762,21 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
     termination_words = kwargs.get("termination_words", "</think>\n\nThe final answer is")
     termination_max_tokens = kwargs.pop("termination_max_tokens", 32)
     visual_anchor_top_m = kwargs.pop("visual_anchor_top_m", 32)
+    visual_anchor_attn_last_k = kwargs.pop("visual_anchor_attn_last_k", 4)
+    visual_anchor_lambda_scale = kwargs.pop("visual_anchor_lambda_scale", 1.0)
+    visual_anchor_entropy_upper = kwargs.pop("visual_anchor_entropy_upper", None)
+    visual_anchor_skip_nonword = kwargs.pop("visual_anchor_skip_nonword", False)
+    visual_anchor_single_use = kwargs.pop("visual_anchor_single_use", False)
+    soft_trigger_mode = kwargs.pop("soft_trigger_mode", "legacy")
+    soft_warning_margin = kwargs.pop("soft_warning_margin", 0.4)
+    soft_confirm_margin = kwargs.pop("soft_confirm_margin", 0.6)
+    soft_delta2_threshold = kwargs.pop("soft_delta2_threshold", 0.25)
+    soft_repeat_warning_boost = kwargs.pop("soft_repeat_warning_boost", 0.0)
+    soft_repeat_confirm_boost = kwargs.pop("soft_repeat_confirm_boost", 0.0)
+    soft_repeat_delta2_boost = kwargs.pop("soft_repeat_delta2_boost", 0.0)
+    soft_repeat_cooldown = kwargs.pop("soft_repeat_cooldown", 0)
+    soft_post_reset_ref_margin = kwargs.pop("soft_post_reset_ref_margin", 0.0)
+    soft_post_reset_cooldown = kwargs.pop("soft_post_reset_cooldown", 0)
 
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
@@ -683,6 +826,11 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
     mode = torch.zeros(batch_size, dtype=torch.long, device=device)  # 0: soft, 1: normal
     mode_stay_steps = torch.zeros(batch_size, dtype=torch.long, device=device)
     locked_normal_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    anchor_used = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    pre_soft_armed = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    soft_entry_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+    post_soft_reset_done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    entropy_history = [[] for _ in range(batch_size)]
 
     if max_switch_count is not None:
         switch_count = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -769,15 +917,60 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
                 injecting[done_mask] = False
 
         cur_entropy = -(probs_original * (probs_original.clamp(min=1e-8).log())).sum(dim=-1)
+        delta2 = torch.zeros(cur_batch, dtype=cur_entropy.dtype, device=device)
+        for bi in range(cur_batch):
+            hist = entropy_history[bi]
+            if hist:
+                recent = hist[-3:]
+                delta2[bi] = cur_entropy[bi] - (sum(recent) / float(len(recent)))
         to_soft = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         to_normal = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        armed_before_step = pre_soft_armed.clone()
+        soft_entry_count_before = soft_entry_count.clone()
         if step == 0:
             cur_ref_entropy = cur_entropy.clone()
         else:
             mode_stay_steps += 1
             allow_switch = (mode_stay_steps >= window_size)
             to_normal = (mode == 0) & (cur_entropy < cur_ref_entropy) & (cur_entropy < b2)
-            to_soft = (mode == 1) & (cur_entropy > cur_ref_entropy) & allow_switch & (~locked_normal_mask) & (cur_entropy > b1)
+            legacy_to_soft = (mode == 1) & (cur_entropy > cur_ref_entropy) & allow_switch & (~locked_normal_mask) & (cur_entropy > b1)
+            if soft_trigger_mode == "dual_delta2":
+                repeat_mask = (soft_entry_count > 0)
+                effective_allow_switch = allow_switch & (
+                    mode_stay_steps >= (window_size + repeat_mask.long() * int(soft_repeat_cooldown))
+                )
+                effective_warning_margin = cur_ref_entropy + soft_warning_margin + (
+                    repeat_mask.float() * soft_repeat_warning_boost
+                )
+                effective_confirm_margin = cur_ref_entropy + soft_confirm_margin + (
+                    repeat_mask.float() * soft_repeat_confirm_boost
+                )
+                effective_delta2_threshold = soft_delta2_threshold + (
+                    repeat_mask.float() * soft_repeat_delta2_boost
+                )
+                warn_cond = (
+                    (mode == 1)
+                    & effective_allow_switch
+                    & (~locked_normal_mask)
+                    & (cur_entropy > effective_warning_margin)
+                    & (delta2 > effective_delta2_threshold)
+                )
+                confirm_cond = (
+                    (mode == 1)
+                    & effective_allow_switch
+                    & (~locked_normal_mask)
+                    & pre_soft_armed
+                    & (
+                        (cur_entropy > effective_confirm_margin)
+                        | (delta2 > effective_delta2_threshold)
+                    )
+                )
+                to_soft = legacy_to_soft | confirm_cond
+                clear_armed = to_soft | to_normal | locked_normal_mask | (cur_entropy <= cur_ref_entropy)
+                pre_soft_armed = pre_soft_armed & (~clear_armed)
+                pre_soft_armed = pre_soft_armed | (warn_cond & (~to_soft))
+            else:
+                to_soft = legacy_to_soft
 
             if (to_normal.any() or to_soft.any()) and step % 50 == 0:
                 print(f"[LEAD-ATTEN] Step {step}: to_normal={to_normal.nonzero().squeeze(-1).tolist()}, to_soft={to_soft.nonzero().squeeze(-1).tolist()}")
@@ -786,6 +979,25 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
             mode[to_soft] = 0
             mode_stay_steps[to_normal | to_soft] = 0
             cur_ref_entropy[to_normal | to_soft] = cur_entropy[to_normal | to_soft]
+            soft_entry_count = soft_entry_count + to_soft.long()
+            post_soft_reset_mask = (
+                to_normal
+                & (soft_entry_count > 0)
+                & (~post_soft_reset_done)
+            )
+            if post_soft_reset_mask.any():
+                cur_ref_entropy = torch.where(
+                    post_soft_reset_mask,
+                    cur_entropy + soft_post_reset_ref_margin,
+                    cur_ref_entropy,
+                )
+                if soft_post_reset_cooldown > 0:
+                    mode_stay_steps = torch.where(
+                        post_soft_reset_mask,
+                        torch.full_like(mode_stay_steps, -int(soft_post_reset_cooldown)),
+                        mode_stay_steps,
+                    )
+                post_soft_reset_done = post_soft_reset_done | post_soft_reset_mask
 
             if to_normal.any() or to_soft.any():
                 print(f"[LEAD-ATTEN] Step {step}: switch entropy={cur_entropy.mean().item():.4f}")
@@ -803,7 +1015,7 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
         soft_emb = torch.matmul(probs_original, E)
 
         alpha = alpha_0 + (1 - alpha_0) * float(step) / float(max_new_tokens)
-        lambda_t = max(0.0, min(1.0, a * (1.0 - alpha)))
+        lambda_t = max(0.0, min(1.0, a * (1.0 - alpha) * visual_anchor_lambda_scale))
         if step == 0:
             soft_emb = 0.9 * soft_emb + 0.1 * line_break_emb
 
@@ -818,8 +1030,24 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
                 visual_token_mask=visual_token_mask,
                 prompt_len=prompt_len,
                 top_m=visual_anchor_top_m,
+                attn_last_k=visual_anchor_attn_last_k,
             )
             apply_anchor = to_soft & has_anchor.to(to_soft.device)
+            if visual_anchor_single_use:
+                apply_anchor = apply_anchor & (~anchor_used)
+            if visual_anchor_entropy_upper is not None:
+                apply_anchor = apply_anchor & (cur_entropy <= visual_anchor_entropy_upper)
+            if visual_anchor_skip_nonword:
+                keep_flags = []
+                for bi in range(cur_batch):
+                    token_text = tokenizer.decode(
+                        [int(next_tokens[bi].item())],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    keep_flags.append(bool(re.search(r"[A-Za-z0-9]", token_text)))
+                keep_mask = torch.tensor(keep_flags, dtype=torch.bool, device=device)
+                apply_anchor = apply_anchor & keep_mask
             anchor_applied = apply_anchor.to(device)
             guided_candidates = (1.0 - lambda_t) * soft_emb + lambda_t * dynamic_anchor.to(soft_emb.device)
             guided_soft_emb = torch.where(
@@ -827,6 +1055,7 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
                 guided_candidates,
                 soft_emb,
             )
+            anchor_used = anchor_used | anchor_applied
             print(
                 f"[LEAD-ATTEN] Step {step}: visual_anchor_applied="
                 f"{anchor_applied.nonzero().squeeze(-1).tolist()}"
@@ -871,6 +1100,7 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
         for bi, orig in enumerate(unfinished_idx):
             token_id = next_tokens[bi].item()
             all_generated[orig].append(token_id)
+            entropy_history[bi].append(float(cur_entropy[bi].item()))
             if token_trace is not None:
                 token_trace.append({
                     "step": int(step),
@@ -883,6 +1113,13 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
                     "alpha": float(alpha),
                     "beta": float(beta),
                     "lambda_t": float(lambda_t),
+                    "delta2": float(delta2[bi].item()),
+                    "armed_before_step": bool(armed_before_step[bi].item()),
+                    "soft_entry_count_before": int(soft_entry_count_before[bi].item()),
+                    "to_soft": bool(to_soft[bi].item()),
+                    "to_normal": bool(to_normal[bi].item()),
+                    "soft_trigger_mode": soft_trigger_mode,
+                    "post_soft_reset_done": bool(post_soft_reset_done[bi].item()),
                     "anchor_applied": bool(anchor_applied[bi].item()),
                 })
             if stream_callback is not None:
@@ -909,6 +1146,11 @@ def generate_lead_attenachor(model, tokenizer, **kwargs):
         locked_normal_mask = locked_normal_mask[keep_idx]
         prompt_hidden_states = prompt_hidden_states[keep_idx]
         visual_token_mask = visual_token_mask[keep_idx]
+        anchor_used = anchor_used[keep_idx]
+        pre_soft_armed = pre_soft_armed[keep_idx]
+        soft_entry_count = soft_entry_count[keep_idx]
+        post_soft_reset_done = post_soft_reset_done[keep_idx]
+        entropy_history = [entropy_history[i] for i in keep_idx.tolist()]
         if hasattr(past_key_values, "batch_select_indices"):
             keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
             past_key_values.batch_select_indices(keep_idx_tensor)

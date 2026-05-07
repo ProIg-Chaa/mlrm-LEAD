@@ -16,6 +16,7 @@ from .generation_utils import (
     set_seed,
     get_math_symbols_ids,
     generate_cot,
+    generate_pure_soft,
     generate_lead,
     generate_lead_attenachor,
 )
@@ -151,7 +152,29 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["window_size"] = args.window_size
             model_inputs["convergence_words"] = "</think>"
             model_inputs["visual_anchor_top_m"] = args.visual_anchor_top_m
+            model_inputs["visual_anchor_attn_last_k"] = args.visual_anchor_attn_last_k
+            model_inputs["visual_anchor_lambda_scale"] = args.visual_anchor_lambda_scale
+            model_inputs["visual_anchor_entropy_upper"] = args.visual_anchor_entropy_upper
+            model_inputs["visual_anchor_skip_nonword"] = args.visual_anchor_skip_nonword
+            model_inputs["visual_anchor_single_use"] = args.visual_anchor_single_use
+            model_inputs["soft_trigger_mode"] = args.soft_trigger_mode
+            model_inputs["soft_warning_margin"] = args.soft_warning_margin
+            model_inputs["soft_confirm_margin"] = args.soft_confirm_margin
+            model_inputs["soft_delta2_threshold"] = args.soft_delta2_threshold
+            model_inputs["soft_repeat_warning_boost"] = args.soft_repeat_warning_boost
+            model_inputs["soft_repeat_confirm_boost"] = args.soft_repeat_confirm_boost
+            model_inputs["soft_repeat_delta2_boost"] = args.soft_repeat_delta2_boost
+            model_inputs["soft_repeat_cooldown"] = args.soft_repeat_cooldown
+            model_inputs["soft_post_reset_ref_margin"] = args.soft_post_reset_ref_margin
+            model_inputs["soft_post_reset_cooldown"] = args.soft_post_reset_cooldown
             outputs = generate_lead_attenachor(
+                model,
+                tokenizer,
+                **model_inputs,
+                **gen_kwargs,
+            )
+        elif args.method == "pure_soft":
+            outputs = generate_pure_soft(
                 model,
                 tokenizer,
                 **model_inputs,

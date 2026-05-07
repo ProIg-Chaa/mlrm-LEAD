@@ -419,8 +419,8 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="lead",
-        choices=["lead", "lead_attenachor", "lead_attenanchor", "cot", "cot_greedy"],
-        help="推理方法：lead / lead_attenachor / cot / cot_greedy",
+        choices=["lead", "lead_attenachor", "lead_attenanchor", "cot", "cot_greedy", "pure_soft"],
+        help="推理方法：lead / lead_attenachor / pure_soft / cot / cot_greedy",
     )
     parser.add_argument("--alpha", type=float, default=0.6,
                         help="LEAD alpha_0 参数")
@@ -430,6 +430,37 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 离散到潜在模式切换的最小持续步数")
     parser.add_argument("--visual_anchor_top_m", type=int, default=32,
                         help="lead_attenachor 中按当前 token 对视觉 token attention 选取的 top-m")
+    parser.add_argument("--visual_anchor_attn_last_k", type=int, default=4,
+                        help="lead_attenachor 中用于聚合的最后几层 attention；<=0 表示使用全部层")
+    parser.add_argument("--visual_anchor_lambda_scale", type=float, default=1.0,
+                        help="lead_attenachor 中视觉 anchor 融合系数的额外缩放")
+    parser.add_argument("--visual_anchor_entropy_upper", type=float, default=None,
+                        help="lead_attenachor 中若当前 token 原始熵高于该阈值，则跳过 anchor 注入")
+    parser.add_argument("--visual_anchor_skip_nonword", action="store_true",
+                        help="lead_attenachor 中若当前 token 解码后为空白/标点样式，则跳过 anchor 注入")
+    parser.add_argument("--visual_anchor_single_use", action="store_true",
+                        help="lead_attenachor 中每个样本最多只允许一次 anchor 注入")
+    parser.add_argument("--soft_trigger_mode", type=str, default="legacy",
+                        choices=["legacy", "dual_delta2"],
+                        help="lead_attenachor 的 soft 触发逻辑：legacy 或 dual_delta2")
+    parser.add_argument("--soft_warning_margin", type=float, default=0.4,
+                        help="dual_delta2 模式下的预警阈值，相对 cur_ref_entropy 的边际增量")
+    parser.add_argument("--soft_confirm_margin", type=float, default=0.6,
+                        help="dual_delta2 模式下 armed 后确认切换的阈值，相对 cur_ref_entropy 的边际增量")
+    parser.add_argument("--soft_delta2_threshold", type=float, default=0.25,
+                        help="dual_delta2 模式下 Δ2 = H_t - mean(H_{t-3:t-1}) 的阈值")
+    parser.add_argument("--soft_repeat_warning_boost", type=float, default=0.0,
+                        help="dual_delta2 模式下，对第 2 次及以后 soft 触发追加的 warning margin")
+    parser.add_argument("--soft_repeat_confirm_boost", type=float, default=0.0,
+                        help="dual_delta2 模式下，对第 2 次及以后 soft 触发追加的 confirm margin")
+    parser.add_argument("--soft_repeat_delta2_boost", type=float, default=0.0,
+                        help="dual_delta2 模式下，对第 2 次及以后 soft 触发追加的 Δ2 阈值")
+    parser.add_argument("--soft_repeat_cooldown", type=int, default=0,
+                        help="dual_delta2 模式下，对第 2 次及以后 soft 触发追加的最小等待步数")
+    parser.add_argument("--soft_post_reset_ref_margin", type=float, default=0.0,
+                        help="首次 soft->normal 后，将 cur_ref_entropy 重置为当前熵加该边际")
+    parser.add_argument("--soft_post_reset_cooldown", type=int, default=0,
+                        help="首次 soft->normal 后，额外增加的冷却步数")
     parser.add_argument(
         "--save_token_entropy",
         action="store_true",
@@ -584,6 +615,21 @@ def main():
         "max_switch_count": args.max_switch_count,
         "window_size": args.window_size,
         "visual_anchor_top_m": args.visual_anchor_top_m,
+        "visual_anchor_attn_last_k": args.visual_anchor_attn_last_k,
+        "visual_anchor_lambda_scale": args.visual_anchor_lambda_scale,
+        "visual_anchor_entropy_upper": args.visual_anchor_entropy_upper,
+        "visual_anchor_skip_nonword": args.visual_anchor_skip_nonword,
+        "visual_anchor_single_use": args.visual_anchor_single_use,
+        "soft_trigger_mode": args.soft_trigger_mode,
+        "soft_warning_margin": args.soft_warning_margin,
+        "soft_confirm_margin": args.soft_confirm_margin,
+        "soft_delta2_threshold": args.soft_delta2_threshold,
+        "soft_repeat_warning_boost": args.soft_repeat_warning_boost,
+        "soft_repeat_confirm_boost": args.soft_repeat_confirm_boost,
+        "soft_repeat_delta2_boost": args.soft_repeat_delta2_boost,
+        "soft_repeat_cooldown": args.soft_repeat_cooldown,
+        "soft_post_reset_ref_margin": args.soft_post_reset_ref_margin,
+        "soft_post_reset_cooldown": args.soft_post_reset_cooldown,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
