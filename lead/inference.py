@@ -16,6 +16,7 @@ from .generation_utils import (
     set_seed,
     get_math_symbols_ids,
     generate_cot,
+    generate_cot_visual_reanchor,
     generate_pure_soft,
     generate_lead,
     generate_lead_attenachor,
@@ -126,6 +127,20 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
     }
     if args.token_entropy_trace is not None:
         gen_kwargs["token_trace"] = args.token_entropy_trace
+    if getattr(args, "save_visual_attn_summary", False):
+        gen_kwargs["log_visual_attn_summary"] = True
+        gen_kwargs["visual_attn_summary_last_k"] = args.visual_attn_summary_last_k
+    if args.method == "cot_visual_reanchor":
+        gen_kwargs["reanchor_entropy_threshold"] = args.reanchor_entropy_threshold
+        gen_kwargs["reanchor_visual_attn_threshold"] = args.reanchor_visual_attn_threshold
+        gen_kwargs["reanchor_lambda"] = args.reanchor_lambda
+        gen_kwargs["reanchor_top_m"] = args.reanchor_top_m
+        gen_kwargs["reanchor_attn_last_k"] = args.reanchor_attn_last_k
+        gen_kwargs["reanchor_max_trigger_count"] = args.reanchor_max_trigger_count
+        gen_kwargs["reanchor_cooldown"] = args.reanchor_cooldown
+        gen_kwargs["reanchor_min_step"] = args.reanchor_min_step
+        gen_kwargs["reanchor_max_step"] = args.reanchor_max_step
+        gen_kwargs["reanchor_anchor_mode"] = args.reanchor_anchor_mode
 
     if args.method == "cot_greedy":
         gen_kwargs["do_sample"] = False
@@ -181,12 +196,20 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
                 **gen_kwargs,
             )
         else:
-            outputs = generate_cot(
-                model,
-                tokenizer,
-                **model_inputs,
-                **gen_kwargs,
-            )
+            if args.method == "cot_visual_reanchor":
+                outputs = generate_cot_visual_reanchor(
+                    model,
+                    tokenizer,
+                    **model_inputs,
+                    **gen_kwargs,
+                )
+            else:
+                outputs = generate_cot(
+                    model,
+                    tokenizer,
+                    **model_inputs,
+                    **gen_kwargs,
+                )
 
     generated_text = tokenizer.decode(
         outputs[0][prompt_len:],

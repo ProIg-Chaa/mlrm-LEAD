@@ -419,8 +419,8 @@ def parse_args() -> argparse.Namespace:
         "--method",
         type=str,
         default="lead",
-        choices=["lead", "lead_attenachor", "lead_attenanchor", "cot", "cot_greedy", "pure_soft"],
-        help="推理方法：lead / lead_attenachor / pure_soft / cot / cot_greedy",
+        choices=["lead", "lead_attenachor", "lead_attenanchor", "cot", "cot_greedy", "cot_visual_reanchor", "pure_soft"],
+        help="推理方法：lead / lead_attenachor / pure_soft / cot / cot_greedy / cot_visual_reanchor",
     )
     parser.add_argument("--alpha", type=float, default=0.6,
                         help="LEAD alpha_0 参数")
@@ -461,6 +461,27 @@ def parse_args() -> argparse.Namespace:
                         help="首次 soft->normal 后，将 cur_ref_entropy 重置为当前熵加该边际")
     parser.add_argument("--soft_post_reset_cooldown", type=int, default=0,
                         help="首次 soft->normal 后，额外增加的冷却步数")
+    parser.add_argument("--reanchor_entropy_threshold", type=float, default=1.0,
+                        help="cot_visual_reanchor 中触发视觉增强的 raw entropy 下限")
+    parser.add_argument("--reanchor_visual_attn_threshold", type=float, default=0.12,
+                        help="cot_visual_reanchor 中触发视觉增强的 visual_attn_mass 上限")
+    parser.add_argument("--reanchor_lambda", type=float, default=0.15,
+                        help="cot_visual_reanchor 中视觉 anchor 混入下一步 embedding 的系数")
+    parser.add_argument("--reanchor_top_m", type=int, default=4,
+                        help="cot_visual_reanchor 中构造动态视觉 anchor 时使用的 top-m 视觉 token")
+    parser.add_argument("--reanchor_attn_last_k", type=int, default=4,
+                        help="cot_visual_reanchor 中构造动态视觉 anchor 时聚合的最后几层 attention")
+    parser.add_argument("--reanchor_max_trigger_count", type=int, default=1,
+                        help="cot_visual_reanchor 中每个样本最多触发几次视觉增强")
+    parser.add_argument("--reanchor_cooldown", type=int, default=32,
+                        help="cot_visual_reanchor 中两次视觉增强之间的最小冷却 token 数")
+    parser.add_argument("--reanchor_min_step", type=int, default=None,
+                        help="cot_visual_reanchor 中允许触发的最小 step（含）")
+    parser.add_argument("--reanchor_max_step", type=int, default=None,
+                        help="cot_visual_reanchor 中允许触发的最大 step（含）")
+    parser.add_argument("--reanchor_anchor_mode", type=str, default="dynamic",
+                        choices=["dynamic", "mean"],
+                        help="cot_visual_reanchor 中 top-m 视觉 token 的聚合方式：dynamic 为原 latent 加权，mean 为简单平均")
     parser.add_argument(
         "--save_token_entropy",
         action="store_true",
@@ -470,6 +491,17 @@ def parse_args() -> argparse.Namespace:
         "--save_full_token_entropy",
         action="store_true",
         help="保存完整逐 token 熵轨迹到 token_entropy_full.jsonl，便于画曲线",
+    )
+    parser.add_argument(
+        "--save_visual_attn_summary",
+        action="store_true",
+        help="在 cot/cot_greedy 推理时为每个生成 token 记录视觉注意力摘要",
+    )
+    parser.add_argument(
+        "--visual_attn_summary_last_k",
+        type=int,
+        default=4,
+        help="视觉注意力摘要聚合时使用最后几层 attention；<=0 表示使用全部层",
     )
 
     # ---- 采样参数 ----
@@ -630,6 +662,16 @@ def main():
         "soft_repeat_cooldown": args.soft_repeat_cooldown,
         "soft_post_reset_ref_margin": args.soft_post_reset_ref_margin,
         "soft_post_reset_cooldown": args.soft_post_reset_cooldown,
+        "reanchor_entropy_threshold": args.reanchor_entropy_threshold,
+        "reanchor_visual_attn_threshold": args.reanchor_visual_attn_threshold,
+        "reanchor_lambda": args.reanchor_lambda,
+        "reanchor_top_m": args.reanchor_top_m,
+        "reanchor_attn_last_k": args.reanchor_attn_last_k,
+        "reanchor_max_trigger_count": args.reanchor_max_trigger_count,
+        "reanchor_cooldown": args.reanchor_cooldown,
+        "reanchor_min_step": args.reanchor_min_step,
+        "reanchor_max_step": args.reanchor_max_step,
+        "reanchor_anchor_mode": args.reanchor_anchor_mode,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -639,6 +681,8 @@ def main():
         "num_samples": len(dataset),
         "save_token_entropy": args.save_token_entropy,
         "save_full_token_entropy": args.save_full_token_entropy,
+        "save_visual_attn_summary": args.save_visual_attn_summary,
+        "visual_attn_summary_last_k": args.visual_attn_summary_last_k,
     }
     if args.save_token_entropy:
         config["token_entropy_path"] = token_entropy_path

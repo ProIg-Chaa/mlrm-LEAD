@@ -396,3 +396,203 @@ Revised interpretation across MMVP + VStar:
   - `results.jsonl`
   - `token_entropy_full.jsonl`
   - specialized re-evaluation report when dataset format requires it
+
+## Current Project State (2026-05-08)
+
+### Main active conclusions
+
+1. `lead_attenachor` on `VStar` has not beaten the original `lead` baseline.
+2. `pure_soft` and some `cot` settings can show a strong
+   "wrong is more confident, lower-entropy, longer, and slower" pattern.
+3. `lead` weakens that pattern on average on several datasets, but does not
+   eliminate the dangerous high-confidence error tail.
+4. `MMVP` and `PhysUniBench` both require corrected evaluation:
+   - `MMVP`: use specialized evaluator and track `pair_accuracy`
+   - `PhysUniBench`: use specialized re-evaluation before drawing conclusions
+
+### Datasets with usable recent LEAD traces
+
+- `output/experiments/20260501/lead_mmvp_vstar_parallel_004123/mmvp_full_gpu0`
+- `output/experiments/20260501/lead_mmvp_vstar_parallel_004123/vstar_full_gpu1`
+- `output/experiments/20260501/lead_phys300_visulogic_parallel_155552/physunibench_uniform300_gpu0`
+- `output/experiments/20260501/lead_phys300_visulogic_parallel_155552/visulogic_full_gpu1`
+
+These all contain:
+
+- `results.jsonl`
+- `token_entropy_full.jsonl`
+- sample-level `output_tokens`
+- sample-level `latency_sec`
+
+### VStar pure-soft status
+
+- only a `50`-sample subset run is currently present:
+  - `output/experiments/20260429/vstar_pure_soft_50_203818_setsid`
+- no full `VStar pure_soft` experiment directory has been found yet
+
+### Attention-analysis motivation
+
+The next mechanism question is:
+
+- in pure `cot`, when token entropy is high, is the model's attention to visual
+  tokens abnormally weak or abnormally diffuse?
+
+Current code already provides a good reuse point:
+
+- `lead/generation_utils.py`
+  - `_compute_dynamic_visual_anchor(...)`
+
+That code already knows how to aggregate current-token attention over visual
+tokens. The likely next clean implementation is to log visual-attention summary
+statistics for each token during `cot`, rather than storing full attention
+matrices.
+
+## Experiment Launch Chain
+
+### Standard runtime outputs
+
+For all recent experiments, the minimum files to preserve are:
+
+- `config.json`
+- `results.jsonl`
+- `eval_report.json`
+- `token_entropy.jsonl`
+- `token_entropy_full.jsonl` when available
+- `nohup.log`
+- `run_command.sh`
+
+### Typical workflow
+
+1. Launch a dataset-specific script under `script/`
+2. Wait for `results.jsonl` and `token_entropy_full.jsonl`
+3. If dataset is `MMVP` or `PhysUniBench`, run specialized re-evaluation
+4. Run correct/wrong confidence summaries and optional plots
+5. Update `log.md` and write summary notes into `result/`
+
+### Stable launch pattern
+
+Recent stable scripts use the environment Python path directly:
+
+- `/share/home/wangzixu/.local/share/mamba/envs/mlrm-lead/bin/python`
+
+This is preferred over `micromamba run -n mlrm-lead ...` because recent
+parallel launches hit `mamba` proc-lock waiting.
+
+### Existing useful launch scripts
+
+- `script/run_lead_mmvp_vstar_parallel.sh`
+- `script/run_lead_phys300_visulogic_parallel.sh`
+- `script/run_cot_physunibench300_mmvp_parallel.sh`
+- `script/run_pure_soft_physunibench300_mmvp_parallel.sh`
+- `script/run_vstar_lead_paper_params.sh`
+
+### Evaluation chain by dataset
+
+#### MMVP
+
+1. Run inference
+2. Do **not** trust the default repository `eval_report.json`
+3. Run:
+   - `script/evaluate_specialized_results.py --mode mmvp`
+4. Use `pair_accuracy` when reporting benchmark-style results
+
+#### PhysUniBench
+
+1. Run inference
+2. Do **not** trust default `eval_report.json` alone
+3. Run:
+   - `script/evaluate_specialized_results.py --mode physunibench`
+4. Inspect `failed_extraction` before interpreting accuracy
+
+#### VStar / VisuLogic
+
+1. Run inference
+2. Default evaluator is usually usable
+3. For confidence analysis, use:
+   - `script/plot_pure_soft_correct_wrong_curves.py`
+
+### Current immediate next task
+
+- run full `VStar pure_soft`
+- then use the resulting traces to compare against:
+  - `VStar lead`
+  - earlier `VStar pure_soft 50`
+- after that, add token-level visual-attention summary logging for `cot`
+
+## 2026-05-08: COT visual-attention summary logging completed
+
+The COT path now supports token-level visual-attention summary logging, aimed at
+checking whether high-entropy generation steps are associated with weak visual
+grounding.
+
+### Code changes
+
+- `lead/generation_utils.py`
+  - `generate_cot(...)` now optionally records per-token visual attention
+    summaries.
+  - added `_summarize_visual_attention(...)`
+- `lead/inference.py`
+  - passes visual-attention logging flags into `generate_cot(...)`
+- `main.py`
+  - added:
+    - `--save_visual_attn_summary`
+    - `--visual_attn_summary_last_k`
+
+### Logged per-token fields
+
+When `--save_visual_attn_summary` is enabled, each token in
+`token_entropy_full.jsonl` can now include:
+
+- `visual_attn_available`
+- `visual_attn_mass`
+- `visual_attn_top1`
+- `visual_attn_top4_sum`
+- `visual_attn_entropy`
+- `visual_attn_token_count`
+
+These are computed from the current generated token's decoder attention over
+prompt visual tokens only, aggregated over the last `k` layers
+(`--visual_attn_summary_last_k`, default `4`).
+
+### Analysis script
+
+Added:
+
+- `script/analyze_cot_visual_attention_vs_entropy.py`
+
+This script compares visual-attention statistics for:
+
+- all eligible tokens
+- high-entropy tokens by absolute threshold
+- high-entropy tokens by per-sample top quantile
+
+and splits results into:
+
+- overall
+- correct samples
+- wrong samples
+
+Useful flags:
+
+- `--reasoning_only`
+- `--exclude_nonword`
+
+### Launch script
+
+Added:
+
+- `script/run_vstar_cot_visual_attn_full.sh`
+
+This runs full `VStar` with:
+
+- `method=cot`
+- `--no-do_sample`
+- `--save_token_entropy`
+- `--save_full_token_entropy`
+- `--save_visual_attn_summary`
+
+### Recommended first target
+
+Use `VStar` first for this mechanism analysis. It is cleaner than
+`PhysUniBench` and better for asking whether high-entropy reasoning tokens are
+looking at the image weakly, diffusely, or normally.

@@ -17,6 +17,7 @@ from .generation_utils import (
     set_seed,
     get_math_symbols_ids,
     generate_cot,
+    generate_cot_visual_reanchor,
     generate_pure_soft,
     generate_lead,
     generate_lead_attenachor,

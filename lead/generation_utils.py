@@ -92,11 +92,19 @@ def generate_cot(model, tokenizer, **kwargs):
 
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
+    log_visual_attn_summary = kwargs.pop("log_visual_attn_summary", False)
+    visual_attn_summary_last_k = kwargs.pop("visual_attn_summary_last_k", 4)
 
     # ============================================
 
     batch_size = input_ids.shape[0]
     device = input_ids.device
+    prompt_len = input_ids.shape[1]
+    visual_token_mask = (
+        _build_visual_token_mask(input_ids, tokenizer)
+        if log_visual_attn_summary
+        else None
+    )
 
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
     unfinished_idx = list(range(batch_size))
@@ -105,89 +113,137 @@ def generate_cot(model, tokenizer, **kwargs):
     attn_mask = attention_mask.clone() if attention_mask is not None else None
     past_key_values = None
     cache_position = torch.arange(generated.shape[1], device=device, dtype=torch.long)
-        
-    for step in range(max_new_tokens):
-        cur_batch = generated.shape[0]
-        if cur_batch == 0:
-            break
+    attn_config_values = None
+    if log_visual_attn_summary:
+        attn_config_values = _get_text_attn_implementation(model)
+        _set_text_attn_implementation(attn_config_values, "eager")
 
-        if past_key_values is None:
-            model_inputs = {"input_ids": generated}
-            if attn_mask is not None:
-                model_inputs["attention_mask"] = attn_mask
+    try:
+        for step in range(max_new_tokens):
+            cur_batch = generated.shape[0]
+            if cur_batch == 0:
+                break
+
+            if past_key_values is None:
+                model_inputs = {"input_ids": generated}
+                if attn_mask is not None:
+                    model_inputs["attention_mask"] = attn_mask
+                if vision_inputs:
+                    model_inputs.update(vision_inputs)
+                model_inputs["cache_position"] = cache_position
+            else:
+                if attn_mask is not None:
+                    attention_mask_new = torch.ones((cur_batch, 1), dtype=attn_mask.dtype, device=device)
+                    attn_mask = torch.cat([attn_mask, attention_mask_new], dim=1)
+                model_inputs = {
+                    "input_ids": next_tokens.unsqueeze(1),
+                    "past_key_values": past_key_values,
+                }
+                if attn_mask is not None:
+                    model_inputs["attention_mask"] = attn_mask
+                model_inputs["cache_position"] = cache_position
+
+            need_visual_attn_summary = log_visual_attn_summary and (past_key_values is not None)
+
+            with torch.no_grad():
+                outputs = model(
+                    **model_inputs,
+                    use_cache=True,
+                    output_attentions=need_visual_attn_summary,
+                )
+            past_key_values = outputs.past_key_values
             if vision_inputs:
-                model_inputs.update(vision_inputs)
-            model_inputs["cache_position"] = cache_position
-        else:
+                vision_inputs = {}
+            cache_position = cache_position[-1:] + 1
+
+            visual_attn_summary = None
+            if need_visual_attn_summary:
+                visual_attn_summary = _summarize_visual_attention(
+                    attn_layers=outputs.attentions,
+                    visual_token_mask=visual_token_mask,
+                    prompt_len=prompt_len,
+                    attn_last_k=visual_attn_summary_last_k,
+                )
+
+            next_token_logits = outputs.logits[:, -1, :]  # [cur_batch, vocab]
+            raw_probs = F.softmax(next_token_logits, dim=-1)
+            raw_entropy = -(
+                raw_probs * raw_probs.clamp(min=1e-8).log()
+            ).sum(dim=-1)
+            logits = next_token_logits / temperature
+            logits = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)
+
+            probs = F.softmax(logits, dim=-1)
+            filtered_entropy = -(
+                probs * probs.clamp(min=1e-8).log()
+            ).sum(dim=-1)
+            if do_sample:
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_tokens = torch.argmax(probs, dim=-1)
+
+            for bi, orig in enumerate(unfinished_idx):
+                token_id = next_tokens[bi].item()
+                all_generated[orig].append(token_id)
+                if token_trace is not None:
+                    record = {
+                        "step": int(step),
+                        "batch_index": int(orig),
+                        "token_id": int(token_id),
+                        "raw_entropy": float(raw_entropy[bi].item()),
+                        "filtered_entropy": float(filtered_entropy[bi].item()),
+                        "selected_prob": float(probs[bi, next_tokens[bi]].item()),
+                        "mode": "normal",
+                    }
+                    if log_visual_attn_summary and visual_attn_summary is None:
+                        record.update({
+                            "visual_attn_available": False,
+                            "visual_attn_mass": 0.0,
+                            "visual_attn_top1": 0.0,
+                            "visual_attn_top4_sum": 0.0,
+                            "visual_attn_entropy": None,
+                            "visual_attn_token_count": 0,
+                        })
+                    elif visual_attn_summary is not None:
+                        record.update({
+                            "visual_attn_available": bool(visual_attn_summary["available"][bi].item()),
+                            "visual_attn_mass": float(visual_attn_summary["mass"][bi].item()),
+                            "visual_attn_top1": float(visual_attn_summary["top1"][bi].item()),
+                            "visual_attn_top4_sum": float(visual_attn_summary["top4_sum"][bi].item()),
+                            "visual_attn_entropy": (
+                                float(visual_attn_summary["entropy"][bi].item())
+                                if visual_attn_summary["available"][bi].item()
+                                else None
+                            ),
+                            "visual_attn_token_count": int(visual_attn_summary["token_count"][bi].item()),
+                        })
+                    token_trace.append(record)
+                if stream_callback is not None:
+                    stream_callback(all_generated[orig][-1])
+
+            if tokenizer.eos_token_id is not None:
+                cur_finished = (next_tokens == tokenizer.eos_token_id)
+            else:
+                cur_finished = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+            keep_idx = (~cur_finished).nonzero(as_tuple=False).squeeze(-1)
+            unfinished_idx = [unfinished_idx[i] for i in keep_idx.tolist()]
+
+            if len(unfinished_idx) == 0:
+                break
+            generated = generated[keep_idx]
+            next_tokens = next_tokens[keep_idx]
+            if attention_mask is not None:
+                attention_mask = attention_mask[keep_idx]
             if attn_mask is not None:
-                attention_mask_new = torch.ones((cur_batch, 1), dtype=attn_mask.dtype, device=device)
-                attn_mask = torch.cat([attn_mask, attention_mask_new], dim=1)
-            model_inputs = {
-                "input_ids": next_tokens.unsqueeze(1),
-                "past_key_values": past_key_values,
-            }
-            if attn_mask is not None:
-                model_inputs["attention_mask"] = attn_mask
-            model_inputs["cache_position"] = cache_position
-
-        with torch.no_grad():
-            outputs = model(**model_inputs, use_cache=True)
-        past_key_values = outputs.past_key_values
-        if vision_inputs:
-            vision_inputs = {}
-        cache_position = cache_position[-1:] + 1
-
-        next_token_logits = outputs.logits[:, -1, :]  # [cur_batch, vocab]
-        raw_probs = F.softmax(next_token_logits, dim=-1)
-        raw_entropy = -(
-            raw_probs * raw_probs.clamp(min=1e-8).log()
-        ).sum(dim=-1)
-        logits = next_token_logits / temperature
-        logits = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)
-
-        probs = F.softmax(logits, dim=-1)
-        filtered_entropy = -(
-            probs * probs.clamp(min=1e-8).log()
-        ).sum(dim=-1)
-        if do_sample:
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        else:
-            next_tokens = torch.argmax(probs, dim=-1)
-
-        for bi, orig in enumerate(unfinished_idx):
-            token_id = next_tokens[bi].item()
-            all_generated[orig].append(token_id)
-            if token_trace is not None:
-                token_trace.append({
-                    "step": int(step),
-                    "batch_index": int(orig),
-                    "token_id": int(token_id),
-                    "raw_entropy": float(raw_entropy[bi].item()),
-                    "filtered_entropy": float(filtered_entropy[bi].item()),
-                    "selected_prob": float(probs[bi, next_tokens[bi]].item()),
-                    "mode": "normal",
-                })
-            if stream_callback is not None:
-                stream_callback(all_generated[orig][-1])
-
-        if tokenizer.eos_token_id is not None:
-            cur_finished = (next_tokens == tokenizer.eos_token_id)
-        else:
-            cur_finished = torch.zeros(cur_batch, dtype=torch.bool, device=device)
-        keep_idx = (~cur_finished).nonzero(as_tuple=False).squeeze(-1)
-        unfinished_idx = [unfinished_idx[i] for i in keep_idx.tolist()]
-
-        if len(unfinished_idx) == 0:
-            break
-        generated = generated[keep_idx]
-        next_tokens = next_tokens[keep_idx]
-        if attention_mask is not None:
-            attention_mask = attention_mask[keep_idx]
-        if attn_mask is not None:
-            attn_mask = attn_mask[keep_idx]
-        keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=generated.device)
-        if hasattr(past_key_values, "batch_select_indices"):
-            past_key_values.batch_select_indices(keep_idx_tensor)
+                attn_mask = attn_mask[keep_idx]
+            if visual_token_mask is not None:
+                visual_token_mask = visual_token_mask[keep_idx]
+            keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=generated.device)
+            if hasattr(past_key_values, "batch_select_indices"):
+                past_key_values.batch_select_indices(keep_idx_tensor)
+    finally:
+        if attn_config_values is not None:
+            _restore_text_attn_implementation(attn_config_values)
 
     maxlen = max(len(g) for g in all_generated)
     out = torch.full((batch_size, maxlen), tokenizer.pad_token_id or 0, dtype=torch.long, device=device)
@@ -312,6 +368,245 @@ def generate_pure_soft(model, tokenizer, **kwargs):
         keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
         if hasattr(past_key_values, "batch_select_indices"):
             past_key_values.batch_select_indices(keep_idx_tensor)
+
+    maxlen = max(len(g) for g in all_generated)
+    out = torch.full((batch_size, maxlen), tokenizer.pad_token_id or 0, dtype=torch.long, device=device)
+    for i, ids in enumerate(all_generated):
+        out[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+    return out
+
+
+def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
+    """COT decoding with gated visual-anchor injection on the next-step embedding."""
+    input_ids = kwargs.pop("input_ids")
+    attention_mask = kwargs.pop("attention_mask")
+    vision_inputs = {}
+    for key in list(kwargs.keys()):
+        if any(tag in key for tag in ("pixel", "image", "video")):
+            value = kwargs.pop(key)
+            if value is not None:
+                vision_inputs[key] = value
+
+    temperature = kwargs.get("temperature", 1.0)
+    top_p = kwargs.get("top_p", 1.0)
+    top_k = kwargs.get("top_k", 0)
+    min_p = kwargs.get("min_p", 0)
+    max_new_tokens = kwargs.get("max_new_tokens", 32768)
+    do_sample = kwargs.get("do_sample", True)
+
+    reanchor_entropy_threshold = kwargs.pop("reanchor_entropy_threshold", 1.0)
+    reanchor_visual_attn_threshold = kwargs.pop("reanchor_visual_attn_threshold", 0.12)
+    reanchor_lambda = kwargs.pop("reanchor_lambda", 0.15)
+    reanchor_top_m = kwargs.pop("reanchor_top_m", 4)
+    reanchor_attn_last_k = kwargs.pop("reanchor_attn_last_k", 4)
+    reanchor_max_trigger_count = kwargs.pop("reanchor_max_trigger_count", 1)
+    reanchor_cooldown = kwargs.pop("reanchor_cooldown", 32)
+    reanchor_min_step = kwargs.pop("reanchor_min_step", None)
+    reanchor_max_step = kwargs.pop("reanchor_max_step", None)
+    reanchor_anchor_mode = kwargs.pop("reanchor_anchor_mode", "dynamic")
+
+    stream_callback = kwargs.pop("stream_callback", None)
+    token_trace = kwargs.pop("token_trace", None)
+    log_visual_attn_summary = kwargs.pop("log_visual_attn_summary", False)
+    visual_attn_summary_last_k = kwargs.pop("visual_attn_summary_last_k", 4)
+
+    batch_size = input_ids.shape[0]
+    device = input_ids.device
+    prompt_len = input_ids.shape[1]
+    visual_token_mask = _build_visual_token_mask(input_ids, tokenizer)
+    prompt_hidden_states = None
+    E = model.get_input_embeddings().weight
+
+    all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
+    unfinished_idx = list(range(batch_size))
+
+    attn_mask = attention_mask.clone() if attention_mask is not None else None
+    past_key_values = None
+    cache_position = torch.arange(input_ids.shape[1], device=device, dtype=torch.long)
+    last_emb = None
+    trigger_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+    cooldown_remaining = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    attn_config_values = _get_text_attn_implementation(model)
+    _set_text_attn_implementation(attn_config_values, "eager")
+
+    try:
+        for step in range(max_new_tokens):
+            cur_batch = attn_mask.shape[0] if attn_mask is not None else len(unfinished_idx)
+            if cur_batch == 0:
+                break
+
+            if past_key_values is None:
+                model_inputs = {"input_ids": input_ids.clone()}
+                if attn_mask is not None:
+                    model_inputs["attention_mask"] = attn_mask
+                if vision_inputs:
+                    model_inputs.update(vision_inputs)
+                model_inputs["cache_position"] = cache_position
+            else:
+                if attn_mask is not None:
+                    attention_mask_new = torch.ones((cur_batch, 1), dtype=attn_mask.dtype, device=device)
+                    attn_mask = torch.cat([attn_mask, attention_mask_new], dim=1)
+                model_inputs = {
+                    "inputs_embeds": last_emb.unsqueeze(1),
+                    "past_key_values": past_key_values,
+                    "cache_position": cache_position,
+                }
+                if attn_mask is not None:
+                    model_inputs["attention_mask"] = attn_mask
+
+            need_attn = past_key_values is not None
+            with torch.no_grad():
+                outputs = model(
+                    **model_inputs,
+                    use_cache=True,
+                    output_attentions=need_attn,
+                    output_hidden_states=(prompt_hidden_states is None),
+                )
+            past_key_values = outputs.past_key_values
+            if prompt_hidden_states is None:
+                prompt_hidden_states = outputs.hidden_states[-1][:, :prompt_len, :].detach()
+            if vision_inputs:
+                vision_inputs = {}
+            cache_position = cache_position[-1:] + 1
+
+            visual_attn_summary = None
+            if need_attn and log_visual_attn_summary:
+                visual_attn_summary = _summarize_visual_attention(
+                    attn_layers=outputs.attentions,
+                    visual_token_mask=visual_token_mask,
+                    prompt_len=prompt_len,
+                    attn_last_k=visual_attn_summary_last_k,
+                )
+
+            next_token_logits = outputs.logits[:, -1, :]
+            raw_probs = F.softmax(next_token_logits, dim=-1)
+            raw_entropy = -(
+                raw_probs * raw_probs.clamp(min=1e-8).log()
+            ).sum(dim=-1)
+            logits = next_token_logits / temperature
+            logits = apply_sampling_filter(logits, top_k=top_k, top_p=top_p, min_p=min_p)
+            probs = F.softmax(logits, dim=-1)
+            filtered_entropy = -(
+                probs * probs.clamp(min=1e-8).log()
+            ).sum(dim=-1)
+            if do_sample:
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_tokens = torch.argmax(probs, dim=-1)
+
+            next_emb = E[next_tokens]
+            reanchor_triggered = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+
+            if need_attn and outputs.attentions is not None:
+                trigger_mask = (raw_entropy >= float(reanchor_entropy_threshold))
+                if visual_attn_summary is not None:
+                    trigger_mask = trigger_mask & visual_attn_summary["available"]
+                    trigger_mask = trigger_mask & (
+                        visual_attn_summary["mass"] <= float(reanchor_visual_attn_threshold)
+                    )
+                else:
+                    trigger_mask = torch.zeros_like(trigger_mask)
+                if reanchor_min_step is not None:
+                    trigger_mask = trigger_mask & (step >= int(reanchor_min_step))
+                if reanchor_max_step is not None:
+                    trigger_mask = trigger_mask & (step <= int(reanchor_max_step))
+                trigger_mask = trigger_mask & (trigger_count < int(reanchor_max_trigger_count))
+                trigger_mask = trigger_mask & (cooldown_remaining <= 0)
+
+                if trigger_mask.any():
+                    dynamic_anchor, has_anchor = _compute_dynamic_visual_anchor(
+                        attn_layers=outputs.attentions,
+                        soft_emb=torch.matmul(raw_probs, E),
+                        prompt_hidden_states=prompt_hidden_states,
+                        visual_token_mask=visual_token_mask,
+                        prompt_len=prompt_len,
+                        top_m=reanchor_top_m,
+                        attn_last_k=reanchor_attn_last_k,
+                        anchor_mode=reanchor_anchor_mode,
+                    )
+                    apply_anchor = trigger_mask & has_anchor.to(trigger_mask.device)
+                    if apply_anchor.any():
+                        next_emb = torch.where(
+                            apply_anchor[:, None],
+                            (1.0 - float(reanchor_lambda)) * next_emb
+                            + float(reanchor_lambda) * dynamic_anchor.to(next_emb.device),
+                            next_emb,
+                        )
+                        reanchor_triggered = apply_anchor
+                        trigger_count = trigger_count + apply_anchor.long()
+                        cooldown_remaining = torch.where(
+                            apply_anchor,
+                            torch.full_like(cooldown_remaining, int(reanchor_cooldown)),
+                            cooldown_remaining,
+                        )
+
+            cooldown_remaining = torch.clamp(cooldown_remaining - 1, min=0)
+
+            for bi, orig in enumerate(unfinished_idx):
+                token_id = next_tokens[bi].item()
+                all_generated[orig].append(token_id)
+                if token_trace is not None:
+                    record = {
+                        "step": int(step),
+                        "batch_index": int(orig),
+                        "token_id": int(token_id),
+                        "raw_entropy": float(raw_entropy[bi].item()),
+                        "filtered_entropy": float(filtered_entropy[bi].item()),
+                        "selected_prob": float(probs[bi, next_tokens[bi]].item()),
+                        "mode": "normal",
+                        "reanchor_triggered": bool(reanchor_triggered[bi].item()),
+                        "reanchor_trigger_count": int(trigger_count[bi].item()),
+                    }
+                    if log_visual_attn_summary and visual_attn_summary is None:
+                        record.update({
+                            "visual_attn_available": False,
+                            "visual_attn_mass": 0.0,
+                            "visual_attn_top1": 0.0,
+                            "visual_attn_top4_sum": 0.0,
+                            "visual_attn_entropy": None,
+                            "visual_attn_token_count": 0,
+                        })
+                    elif visual_attn_summary is not None:
+                        record.update({
+                            "visual_attn_available": bool(visual_attn_summary["available"][bi].item()),
+                            "visual_attn_mass": float(visual_attn_summary["mass"][bi].item()),
+                            "visual_attn_top1": float(visual_attn_summary["top1"][bi].item()),
+                            "visual_attn_top4_sum": float(visual_attn_summary["top4_sum"][bi].item()),
+                            "visual_attn_entropy": (
+                                float(visual_attn_summary["entropy"][bi].item())
+                                if visual_attn_summary["available"][bi].item()
+                                else None
+                            ),
+                            "visual_attn_token_count": int(visual_attn_summary["token_count"][bi].item()),
+                        })
+                    token_trace.append(record)
+                if stream_callback is not None:
+                    stream_callback(all_generated[orig][-1])
+
+            if tokenizer.eos_token_id is not None:
+                cur_finished = (next_tokens == tokenizer.eos_token_id)
+            else:
+                cur_finished = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+            keep_idx = (~cur_finished).nonzero(as_tuple=False).squeeze(-1)
+            unfinished_idx = [unfinished_idx[i] for i in keep_idx.tolist()]
+
+            if len(unfinished_idx) == 0:
+                break
+            last_emb = next_emb[keep_idx]
+            if attention_mask is not None:
+                attention_mask = attention_mask[keep_idx]
+            if attn_mask is not None:
+                attn_mask = attn_mask[keep_idx]
+            visual_token_mask = visual_token_mask[keep_idx]
+            prompt_hidden_states = prompt_hidden_states[keep_idx]
+            trigger_count = trigger_count[keep_idx]
+            cooldown_remaining = cooldown_remaining[keep_idx]
+            keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
+            if hasattr(past_key_values, "batch_select_indices"):
+                past_key_values.batch_select_indices(keep_idx_tensor)
+    finally:
+        _restore_text_attn_implementation(attn_config_values)
 
     maxlen = max(len(g) for g in all_generated)
     out = torch.full((batch_size, maxlen), tokenizer.pad_token_id or 0, dtype=torch.long, device=device)
@@ -638,6 +933,7 @@ def _compute_dynamic_visual_anchor(
     prompt_len,
     top_m,
     attn_last_k,
+    anchor_mode="dynamic",
 ):
     """
     Select top-m visual tokens from current-token attention, then pool them with
@@ -692,19 +988,94 @@ def _compute_dynamic_visual_anchor(
         top_visual_positions = visual_positions[top_indices]
 
         selected_visual_states = prompt_hidden_states[bi, top_visual_positions, :]
-        latent_scores = torch.matmul(
-            selected_visual_states,
-            soft_emb[bi],
-        ) / math.sqrt(hidden_size)
-        latent_weights = F.softmax(latent_scores, dim=0)
-        anchor = torch.sum(
-            selected_visual_states * latent_weights.unsqueeze(-1),
-            dim=0,
-        )
+        if anchor_mode == "mean":
+            anchor = selected_visual_states.mean(dim=0)
+        elif anchor_mode == "dynamic":
+            latent_scores = torch.matmul(
+                selected_visual_states,
+                soft_emb[bi],
+            ) / math.sqrt(hidden_size)
+            latent_weights = F.softmax(latent_scores, dim=0)
+            anchor = torch.sum(
+                selected_visual_states * latent_weights.unsqueeze(-1),
+                dim=0,
+            )
+        else:
+            raise ValueError(f"Unsupported reanchor_anchor_mode: {anchor_mode}")
         anchors[bi] = anchor
         has_anchor[bi] = True
 
     return anchors, has_anchor
+
+
+def _summarize_visual_attention(
+    attn_layers,
+    visual_token_mask,
+    prompt_len,
+    attn_last_k,
+):
+    if not attn_layers:
+        raise RuntimeError(
+            "visual attention summary requires decoder attentions, "
+            "but model outputs.attentions is empty. Load the model with "
+            "attn_implementation='eager'."
+        )
+
+    layer_views = []
+    if attn_last_k is not None and int(attn_last_k) > 0:
+        attn_layers = attn_layers[-int(attn_last_k):]
+
+    for layer_attn in attn_layers:
+        if layer_attn is None:
+            continue
+        if layer_attn.dim() != 4:
+            raise RuntimeError(
+                f"Unexpected attention tensor rank {layer_attn.dim()} "
+                "in visual attention summary; expected [B, heads, q_len, kv_len]."
+            )
+        layer_views.append(layer_attn[:, :, -1, :].mean(dim=1))
+    if not layer_views:
+        raise RuntimeError("No usable attention layers found in outputs.attentions.")
+
+    current_attn = torch.stack(layer_views, dim=0).mean(dim=0)
+    kv_len = current_attn.shape[-1]
+    prompt_key_len = min(prompt_len, kv_len)
+    batch_size = current_attn.shape[0]
+    device = current_attn.device
+
+    available = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    mass = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    top1 = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    top4_sum = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    entropy = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    token_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    visual_token_mask = visual_token_mask.to(device)
+    for bi in range(batch_size):
+        visual_positions = visual_token_mask[bi, :prompt_key_len].nonzero(as_tuple=False).squeeze(-1)
+        if visual_positions.numel() == 0:
+            continue
+        visual_scores = current_attn[bi, visual_positions]
+        available[bi] = True
+        token_count[bi] = int(visual_positions.numel())
+        mass[bi] = visual_scores.sum()
+        top1[bi] = visual_scores.max()
+        cur_topk = min(4, int(visual_scores.numel()))
+        top4_sum[bi] = torch.topk(visual_scores, k=cur_topk, dim=0).values.sum()
+        if mass[bi].item() > 0:
+            norm_scores = visual_scores / mass[bi]
+            entropy[bi] = -(
+                norm_scores * norm_scores.clamp(min=1e-8).log()
+            ).sum()
+
+    return {
+        "available": available,
+        "mass": mass,
+        "top1": top1,
+        "top4_sum": top4_sum,
+        "entropy": entropy,
+        "token_count": token_count,
+    }
 
 
 def _get_text_attn_implementation(model):
