@@ -596,3 +596,202 @@ This runs full `VStar` with:
 Use `VStar` first for this mechanism analysis. It is cleaner than
 `PhysUniBench` and better for asking whether high-entropy reasoning tokens are
 looking at the image weakly, diffusely, or normally.
+
+## 2026-05-12: VStar clean COT / visual reanchor / mean-anchor control
+
+本阶段围绕 VStar 上的 COT 错题纠错做了几件事：先修正 clean COT 基线，再在 clean wrong subset 上比较 no-op、dynamic visual anchor 和 simple mean anchor。
+
+### 1. Clean VStar COT 基线
+
+此前带 attention logging 的 COT 路径会改变推理行为，因此不能作为“干净 COT”基线。后来补跑了不记录 attention 的 clean COT full：
+
+- 目录：
+  - `output/experiments/20260511_205609/vstar_cot_clean_full_gpu0`
+- 结果：
+  - `137/191 = 71.73%`
+  - failed extraction: `0`
+
+这个结果也解释了为什么论文中 VStar COT 可以到 60% 以上；之前 20% 多的结果来自污染过的 attention logging 路径，不应作为 clean baseline。
+
+### 2. Clean wrong subset
+
+基于 clean COT full 的错题构造了新子集：
+
+- 文件：
+  - `data/vstar_wrong_subset_from_cot_clean.jsonl`
+- 大小：
+  - `54`
+- 定义：
+  - clean COT full 中评估错误的样本
+- 因此该子集上 clean COT baseline 为：
+  - `0/54`
+
+旧的 `data/vstar_wrong_subset_from_cot_visual_attn_rerun.jsonl` 有 `124` 条，但它来自带 attention logging 的污染基线，后续只能作为参考，不能作为主结论依据。
+
+### 3. Visual reanchor 核心代码
+
+主要代码入口：
+
+- `lead/generation_utils.py`
+  - `generate_cot_visual_reanchor(...)`
+  - `_compute_dynamic_visual_anchor(...)`
+  - `_summarize_visual_attention(...)`
+- `lead/inference.py`
+  - 当 `--method cot_visual_reanchor` 时路由到 `generate_cot_visual_reanchor`
+- `main.py`
+  - 增加 `cot_visual_reanchor` 方法和相关 CLI 参数
+
+当前 low-visual reanchor 触发逻辑：
+
+- `raw_entropy >= reanchor_entropy_threshold`
+- `visual_attn_mass <= reanchor_visual_attn_threshold`
+- step 在 `reanchor_min_step` 到 `reanchor_max_step` 内
+- 未超过 `reanchor_max_trigger_count`
+- cooldown 已结束
+
+当前默认/常用参数：
+
+- `reanchor_entropy_threshold = 1.0`
+- `reanchor_visual_attn_threshold = 0.12`
+- `reanchor_lambda = 0.15`
+- `reanchor_top_m = 4`
+- `reanchor_attn_last_k = 4`
+- `reanchor_max_trigger_count = 1`
+- `reanchor_cooldown = 32`
+
+### 4. Dynamic visual anchor 的定义
+
+在触发 token 上：
+
+1. 取 decoder attention 的最后 `reanchor_attn_last_k` 层。
+2. 对 head 平均。
+3. 对层平均。
+4. 只保留 prompt 中视觉 token 位置。
+5. 从视觉 token 中按 attention 分数选 top-m。
+6. 取这些视觉 token 在 prompt prefill 后的最后层 hidden states。
+7. 用当前 raw probability 得到 soft embedding：
+   - `soft_emb = raw_probs @ embedding_matrix`
+8. 用 `selected_visual_states @ soft_emb / sqrt(hidden_size)` 计算 latent 权重。
+9. 对 top-m 视觉 hidden states 做 softmax 加权求和，得到 dynamic anchor。
+10. 将 anchor 混入下一步输入 embedding：
+    - `next_emb = (1 - lambda) * next_emb + lambda * anchor`
+
+注意：这里的视觉 hidden states 不是初始 token embedding，而是 prompt prefill 经过整个模型后的最后层 hidden states。
+
+### 5. No-op / dynamic early 对照
+
+目录：
+
+- `output/experiments/20260511_214958/vstar_clean_wrong_subset_reanchor_noop_early_parallel`
+
+结果：
+
+| 设置 | 正确率 | 触发样本 | 触发样本修正 | 未触发样本修正 |
+|---|---:|---:|---:|---:|
+| no-op, `reanchor_max_trigger_count=0` | `13/54 = 24.07%` | `0/54` | `0` | `13` |
+| dynamic early, `step <= 10` | `15/54 = 27.78%` | `25/54` | `9` | `6` |
+
+重要 caveat：
+
+- no-op 已经能把 `13/54` 改对。
+- 说明 `cot_visual_reanchor` 路径本身和 clean COT 不完全等价。
+- 可能来自：
+  - 强制 eager attention
+  - 使用 `inputs_embeds` 路径继续解码
+  - cache / hidden-state 路径差异
+
+因此，不能把 dynamic early 相对 clean COT 的全部收益都归因于 visual anchor。更合理的因果比较是 dynamic early vs no-op。
+
+dynamic early 相对 no-op：
+
+- 净增 `+2/54`
+- dynamic-only 修正样本：
+  - `[57, 60, 132]`
+- no-op-only 修正样本：
+  - `[9]`
+
+### 6. Mean-anchor control
+
+为验证当前 dynamic anchor 是否比简单平均合理，新增了参数：
+
+- `--reanchor_anchor_mode`
+  - `dynamic`: 原方法，top-m 后 latent soft embedding 加权
+  - `mean`: 同样 top-m 视觉 token，但直接简单平均
+
+新增脚本：
+
+- `script/vstar_reanchor/run_vstar_clean_wrong_subset_mean_anchor_early.sh`
+
+实验目录：
+
+- `output/experiments/20260512_131349/vstar_clean_wrong_subset_mean_anchor_early_gpu0`
+
+结果：
+
+| 设置 | anchor 聚合 | 正确率 | 触发样本 |
+|---|---|---:|---:|
+| no-op | 不触发 | `13/54 = 24.07%` | `0/54` |
+| dynamic early | top-m + latent 加权 | `15/54 = 27.78%` | `25/54` |
+| mean early | top-m 简单平均 | `11/54 = 20.37%` | `25/54` |
+
+样本重叠：
+
+- `dynamic early ∩ mean early = 11`
+- dynamic early 独有修正：
+  - `[54, 60, 129, 167]`
+- mean early 独有修正：
+  - 无
+
+结论：
+
+- 在同样触发样本数和同样 early window 下，dynamic anchor 明显优于 simple mean anchor。
+- 这支持当前“top-m 后再用 soft embedding latent 权重聚合”的设计比 naive mean 更合理。
+
+### 7. 当前主要报告
+
+详细报告写在：
+
+- `result/vstar_wrong_subset_cot_visual_reanchor_report_zh.md`
+
+报告中同时保留了旧 `124` 条 polluted wrong subset 的实验结果和新 `54` 条 clean wrong subset 的对照结果。后续写论文/总结时，应优先引用 clean wrong subset 的 no-op / dynamic / mean 对照。
+
+### 8. 脚本目录整理
+
+VStar / reanchor 相关脚本已移动到：
+
+- `script/vstar_reanchor/`
+
+当前包括：
+
+- `run_vstar_cot_clean_full.sh`
+- `run_vstar_pure_soft_full.sh`
+- `run_vstar_cot_visual_attn_full.sh`
+- `run_vstar_cot_visual_attn_full_rerun.sh`
+- `prepare_vstar_wrong_subset.py`
+- `analyze_cot_visual_attention_vs_entropy.py`
+- `run_vstar_wrong_subset_cot_visual_reanchor.sh`
+- `run_vstar_wrong_subset_cot_visual_reanchor_timing_parallel.sh`
+- `run_vstar_clean_wrong_subset_noop_early_parallel.sh`
+- `run_vstar_clean_wrong_subset_mean_anchor_early.sh`
+
+这些脚本内部仍然显式 `cd` 到项目根目录，所以从新目录执行不影响运行。
+
+### 9. 后续方向
+
+较有价值的下一步：
+
+1. 更干净地拆分实现路径因素：
+   - 分别控制 eager attention、`inputs_embeds` continuation、cache 路径。
+   - 目标是构造一个更接近 clean COT 的 no-op baseline。
+
+2. high-entropy + high-visual-attention route：
+   - low-visual route 当前是 visual reanchor。
+   - 对 high entropy 且 visual attention 已经高的 token，可以尝试 soft embedding 隐式推理：
+     - `next_emb = (1 - beta) * hard_emb + beta * soft_emb`
+   - 这一路不应再注入视觉 anchor，因为模型此时已经在看图，问题可能更像语义/推理分叉。
+
+3. 早期触发继续细分：
+   - `step <= 5`
+   - `step <= 10`
+   - `step <= 20`
+   - 或基于 entropy 突升、visual attention 下降趋势做自适应触发。
