@@ -795,3 +795,237 @@ VStar / reanchor 相关脚本已移动到：
    - `step <= 10`
    - `step <= 20`
    - 或基于 entropy 突升、visual attention 下降趋势做自适应触发。
+
+## 2026-05-14: Online sidecar attention 观测验证
+
+本阶段解决了一个关键方法问题：直接在主推理路径中打开 attention 会污染推理，因此改成“在线旁路观测”。
+
+### 1. COT 口径修正
+
+当前项目已新增：
+
+- `--cot_prompt_mode orign|step`
+
+默认：
+
+- `orign`
+
+含义：
+
+- `orign`: 对齐原项目，不额外追加 `Please think step by step...`
+- `step`: 复现之前显式 step-by-step prompt 的实验口径
+
+对齐原项目的 VStar COT full：
+
+- 目录：
+  - `output/experiments/20260513_210625/vstar_cot_orign_aligned_full_gpu0`
+- 结果：
+  - `120/191 = 62.83%`
+- 与 `/share/home/wangzixu/liudinghao/gushuo/proj/mlrm-orign` 原项目 COT full 完全一致：
+  - 总正确数一致
+  - correct set 一致
+  - extracted answer 一致
+  - `model_answer` 文本逐样本完全一致
+
+因此后续若说“原版/论文口径 COT baseline”，应使用：
+
+- `cot_prompt_mode=orign`
+- `do_sample=True`
+- `temperature=0.6`
+- `top_p=0.95`
+- `top_k=20`
+
+之前的 `137/191 = 71.73%` 是：
+
+- `cot_prompt_mode=step`
+- `--no-do_sample`
+
+不是原项目 COT 口径。
+
+### 2. 在线旁路 attention 设计
+
+目标：
+
+- 主路径保持 clean COT
+- 主 forward 不开 `output_attentions`
+- 主路径不切 eager
+- 当某个已生成 token 的 `raw_entropy` 超过阈值时，临时开一个旁路 replay：
+  - 使用同一个模型
+  - 临时切到 eager
+  - replay 已固定的 `prompt + generated prefix`
+  - 只记录该 token 对 prompt visual tokens 的 attention
+  - 立刻恢复 attention implementation
+  - 不改主路径 KV cache
+  - 不参与下一 token 选择
+
+新增参数：
+
+- `--sidecar_attn_on_entropy`
+- `--sidecar_attn_entropy_threshold`
+- `--sidecar_attn_last_k`
+
+代码位置：
+
+- `lead/generation_utils.py`
+  - `generate_cot(...)`
+  - `_observe_sidecar_visual_attention(...)`
+- `lead/inference.py`
+  - 将 sidecar 参数传入 `generate_cot`
+- `main.py`
+  - CLI 和 config 记录
+
+### 3. 在线旁路验证实验
+
+实验：
+
+- `output/experiments/20260514_151652/vstar_cot_orign_online_sidecar_attn_h2_gpu0`
+
+配置：
+
+- `method=cot`
+- `cot_prompt_mode=orign`
+- `sidecar_attn_on_entropy=True`
+- `sidecar_attn_entropy_threshold=2.0`
+- `save_token_entropy=True`
+- `save_full_token_entropy=True`
+- `save_visual_attn_summary=False`
+
+结果：
+
+- Accuracy: `120/191 = 62.83%`
+- 与 clean aligned COT 完全一致
+- `model_answer` 逐样本完全一致：`191/191`
+
+旁路观测统计：
+
+- 总生成 token: `40575`
+- sidecar observed token: `4681`
+- 覆盖样本: `174/191`
+- sidecar error: `0`
+- visual attention mass:
+  - mean `0.1952`
+  - median `0.1719`
+  - p10 `0.0420`
+  - p90 `0.3965`
+
+结论：
+
+> 在线 sidecar attention replay 可以记录高熵 token 的视觉注意力，并且在当前 VStar full 实验中没有污染主推理输出。
+
+### 4. 后续重做实验优先级
+
+现在应优先重做依赖 attention 的机制分析，使用在线 sidecar 而不是主路径 attention logging。
+
+实验 1：
+
+- 对齐原项目 COT full
+- 在线 sidecar attention
+- 记录高熵 token 的视觉 attention
+- 分析：
+  - `H >= 1.0`
+  - `H >= 1.5`
+  - `H >= 2.0`
+  - correct vs wrong
+  - direct_attributes vs relative_position
+  - reasoning/content/boilerplate token
+  - early/mid/late
+
+实验 2：
+
+- 基于 aligned COT `120/191` 构造 wrong subset，共 `71` 条
+- 在 wrong subset 上做 sidecar trace 和机制分析
+
+实验 3：
+
+- 在 sidecar 观测不污染的前提下，重新设计 intervention：
+  - 不再在开场模板 token 上触发
+  - 优先用 entropy spike + semantic filter
+  - anchor 注入要尽量小，并尽量避免长期 `inputs_embeds` continuation
+
+## 2026-05-15: sidecar 新增两个视觉 grounding 指标
+
+用户提出在在线 sidecar attention 里加入两个新观察量：
+
+1. visual attention concentration
+   - 先只在 image/visual tokens 内部归一化 attention。
+   - 计算视觉注意力熵 `H_vis = -sum alpha_j log alpha_j`。
+   - 用 `log(|V_img|)` 归一化后得到 `H_vis_norm`。
+   - 集中度定义为 `C_vis = 1 - H_vis_norm`。
+   - 含义：高值表示注意力集中在较少视觉 token 上，低值表示视觉 attention 分散。
+
+2. hidden-state visual alignment
+   - 取当前生成 token 的最后层 hidden state。
+   - 取 prompt prefill 后视觉 token 的最后层 hidden states。
+   - 计算当前 hidden state 与所有视觉 token hidden states 的 cosine similarity。
+   - 记录 max cosine 和 top-4 mean cosine。
+   - 含义：高值表示当前语言状态贴近某些视觉 token 表示，低值表示语言状态和视觉表征对齐弱。
+
+已完成代码接入：
+
+- `lead/generation_utils.py`
+  - `_observe_sidecar_visual_attention(...)` 现在在 sidecar replay 时同时请求 `output_hidden_states=True`。
+  - `_summarize_visual_attention(...)` 新增：
+    - `sidecar_visual_attn_entropy_norm`
+    - `sidecar_visual_attn_concentration`
+  - 新增 `_summarize_hidden_visual_alignment(...)`，输出：
+    - `sidecar_hidden_visual_align_max`
+    - `sidecar_hidden_visual_align_top4_mean`
+    - `sidecar_hidden_visual_align_token_count`
+- `script/vstar_reanchor/analyze_online_sidecar_attention.py`
+  - 分析表新增：
+    - `conc_mean`
+    - `align_max_mean`
+    - `align_top4_mean`
+
+验证：
+
+- `python -m py_compile lead/generation_utils.py lead/inference.py main.py script/vstar_reanchor/analyze_online_sidecar_attention.py` 通过。
+- 用小张量检查过 concentration 和 hidden alignment 的数值范围。
+- 旧的 sidecar trace 不包含这些字段，需要重跑 sidecar 实验后才能分析新指标。
+
+新增全量脚本：
+
+- `script/vstar_reanchor/run_vstar_cot_online_sidecar_metrics_h1_full.sh`
+  - 默认 `GPU_ID=1`
+  - VStar full
+  - `method=cot`
+  - `cot_prompt_mode=orign`
+  - `sidecar_attn_entropy_threshold=1.0`
+  - 输出目录名：`vstar_cot_orign_online_sidecar_metrics_h1_gpu${GPU_ID}`
+  - 运行目录内会生成 `analyze_after_done.sh`，用于跑完后产出 `sidecar_attention_metrics_analysis.md`
+
+## 2026-05-20: 补充实验接手文档
+
+用户指出当前实验脉络可以理解，但具体启动和路由实现主要由助手操作，存在离线后难以复现实验的问题。
+
+已新增两份接手文档：
+
+- `EXPERIMENT_RUNBOOK_zh.md`
+  - 说明项目路径、模型路径、数据路径、脚本目录、输出目录。
+  - 说明一次实验如何启动、如何查 pid/log/GPU、如何跑 `compare_after_done.sh`。
+  - 记录代码入口：
+    - `main.py`：命令行参数定义。
+    - `lead/inference.py`：根据 `method` 把参数传给 generation 函数。
+    - `lead/generation_utils.py`：真正实现 `generate_pure_soft`、`generate_lead`、`generate_lead_attenachor`。
+  - 解释当前路由的共同机制：在 pure-soft 中通过 `route_mask` 决定下一步输入用 `normal_emb = E[next_token]` 还是 `soft_emb = probs_original @ E`。
+  - 逐个说明：
+    - low-confidence diffuse collapse
+    - format cooldown
+    - cooldown2 + late64_repeat_gate
+    - answer_zone_discrete
+    - LEAD soft veto
+  - 给出新增路由的推荐修改路径和脚本复制模板。
+
+- `script/exp5_16/README.md`
+  - 说明当前脚本目录下每个脚本的用途。
+  - 记录常用启动、检查、比较命令。
+  - 说明不同类型新实验应该复制哪个脚本。
+
+当前正在跑的两个实验也已写入 runbook：
+
+- `cooldown2 + late64_repeat_gate`
+  - `output/experiments/20260520_113540/pure_soft_cooldown2_late64_repeat_gate_vstar_full/cooldown2_late64_repeat_gate_gpu0`
+  - PID `2825516`
+- `answer_zone_discrete`
+  - `output/experiments/20260520_114012/pure_soft_answer_zone_discrete_vstar_full/answer_zone_discrete_gpu1`
+  - PID `2828661`

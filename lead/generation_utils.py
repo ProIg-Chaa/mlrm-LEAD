@@ -43,6 +43,92 @@ def apply_sampling_filter(logits, top_k=0, top_p=1.0, min_p=0.0):
     return logits
 
 
+def _topk_trace_record(tokenizer, probs, batch_index, top_k):
+    if top_k is None or int(top_k) <= 0:
+        return None
+    cur_top_k = min(int(top_k), int(probs.shape[-1]))
+    vals, ids = torch.topk(probs[batch_index], k=cur_top_k, dim=-1)
+    vals = vals.detach().float().cpu().tolist()
+    ids = ids.detach().long().cpu().tolist()
+    texts = [
+        tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        for token_id in ids
+    ]
+    return [
+        {
+            "token_id": int(token_id),
+            "prob": float(prob),
+            "token_text": text,
+        }
+        for token_id, prob, text in zip(ids, vals, texts)
+    ]
+
+
+def _add_topk_trace_fields(record, tokenizer, raw_probs, filtered_probs, batch_index, trace_topk):
+    if trace_topk is None or int(trace_topk) <= 0:
+        return
+    raw_topk = _topk_trace_record(tokenizer, raw_probs, batch_index, trace_topk)
+    filtered_topk = _topk_trace_record(tokenizer, filtered_probs, batch_index, trace_topk)
+    if raw_topk:
+        record["raw_topk"] = raw_topk
+        record["raw_top1_prob"] = raw_topk[0]["prob"]
+        record["raw_margin"] = (
+            raw_topk[0]["prob"] - raw_topk[1]["prob"]
+            if len(raw_topk) > 1
+            else raw_topk[0]["prob"]
+        )
+    if filtered_topk:
+        record["filtered_topk"] = filtered_topk
+        record["filtered_top1_prob"] = filtered_topk[0]["prob"]
+        record["filtered_margin"] = (
+            filtered_topk[0]["prob"] - filtered_topk[1]["prob"]
+            if len(filtered_topk) > 1
+            else filtered_topk[0]["prob"]
+        )
+
+
+def _entropy_spike_mask(raw_entropy, entropy_history, window, alpha, min_history, min_entropy):
+    batch_size = raw_entropy.shape[0]
+    mask = torch.zeros(batch_size, dtype=torch.bool, device=raw_entropy.device)
+    deltas = torch.zeros(batch_size, dtype=raw_entropy.dtype, device=raw_entropy.device)
+    history_counts = torch.zeros(batch_size, dtype=torch.long, device=raw_entropy.device)
+    window = max(1, int(window))
+    for bi in range(batch_size):
+        hist = entropy_history[bi][-window:]
+        history_counts[bi] = len(hist)
+        if len(hist) < int(min_history):
+            continue
+        hist_tensor = raw_entropy.new_tensor(hist)
+        mean = hist_tensor.mean()
+        std = hist_tensor.std(unbiased=False)
+        threshold = mean + float(alpha) * std
+        deltas[bi] = raw_entropy[bi] - mean
+        mask[bi] = (
+            raw_entropy[bi] >= float(min_entropy)
+            and raw_entropy[bi] > threshold
+        )
+    return mask, deltas, history_counts
+
+
+_FORMAT_TOKEN_TEXTS = {
+    "\n", "\n\n", ".", ",", ":", ";", "-", "(", ")", "[", "]", "{", "}",
+    "<", ">", "</", "<think", "think", "answer", "option", "**", "*",
+}
+
+
+def _is_format_token_text(text):
+    raw = text or ""
+    stripped = raw.strip()
+    lowered = stripped.lower().replace("▁", " ")
+    if not stripped:
+        return True
+    if raw in _FORMAT_TOKEN_TEXTS or stripped in _FORMAT_TOKEN_TEXTS or lowered in _FORMAT_TOKEN_TEXTS:
+        return True
+    if all((not ch.isalnum()) for ch in stripped):
+        return True
+    return False
+
+
 def get_math_symbols_ids(tokenizer):
     math_symbols = [
         "+", "-", "*", "/", "^", "=", "<", ">", "\\leq", "\\geq", "\\neq", "\\approx", "\\sim", "\\equiv", "\\to", "\\implies", "\\iff",
@@ -92,8 +178,12 @@ def generate_cot(model, tokenizer, **kwargs):
 
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
+    trace_topk = kwargs.pop("trace_topk", 0)
     log_visual_attn_summary = kwargs.pop("log_visual_attn_summary", False)
     visual_attn_summary_last_k = kwargs.pop("visual_attn_summary_last_k", 4)
+    sidecar_attn_on_entropy = kwargs.pop("sidecar_attn_on_entropy", False)
+    sidecar_attn_entropy_threshold = kwargs.pop("sidecar_attn_entropy_threshold", 2.0)
+    sidecar_attn_last_k = kwargs.pop("sidecar_attn_last_k", 4)
 
     # ============================================
 
@@ -102,9 +192,10 @@ def generate_cot(model, tokenizer, **kwargs):
     prompt_len = input_ids.shape[1]
     visual_token_mask = (
         _build_visual_token_mask(input_ids, tokenizer)
-        if log_visual_attn_summary
+        if log_visual_attn_summary or sidecar_attn_on_entropy
         else None
     )
+    sidecar_vision_inputs = dict(vision_inputs)
 
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
     unfinished_idx = list(range(batch_size))
@@ -186,6 +277,30 @@ def generate_cot(model, tokenizer, **kwargs):
                 token_id = next_tokens[bi].item()
                 all_generated[orig].append(token_id)
                 if token_trace is not None:
+                    sidecar_record = None
+                    if (
+                        sidecar_attn_on_entropy
+                        and raw_entropy[bi].item() >= float(sidecar_attn_entropy_threshold)
+                        and visual_token_mask is not None
+                    ):
+                        try:
+                            sidecar_record = _observe_sidecar_visual_attention(
+                                model=model,
+                                tokenizer=tokenizer,
+                                generated_ids=all_generated[orig],
+                                prompt_len=prompt_len,
+                                visual_token_mask=visual_token_mask[bi : bi + 1],
+                                vision_inputs=sidecar_vision_inputs,
+                                device=device,
+                                attn_last_k=sidecar_attn_last_k,
+                            )
+                        except Exception as exc:
+                            sidecar_record = {
+                                "sidecar_attn_observed": False,
+                                "sidecar_attn_error_type": type(exc).__name__,
+                                "sidecar_attn_error_message": str(exc),
+                            }
+                            torch.cuda.empty_cache()
                     record = {
                         "step": int(step),
                         "batch_index": int(orig),
@@ -195,6 +310,22 @@ def generate_cot(model, tokenizer, **kwargs):
                         "selected_prob": float(probs[bi, next_tokens[bi]].item()),
                         "mode": "normal",
                     }
+                    _add_topk_trace_fields(
+                        record,
+                        tokenizer,
+                        raw_probs,
+                        probs,
+                        bi,
+                        trace_topk,
+                    )
+                    if sidecar_attn_on_entropy:
+                        if sidecar_record is None:
+                            record.update({
+                                "sidecar_attn_observed": False,
+                                "sidecar_attn_skipped": True,
+                            })
+                        else:
+                            record.update(sidecar_record)
                     if log_visual_attn_summary and visual_attn_summary is None:
                         record.update({
                             "visual_attn_available": False,
@@ -272,6 +403,24 @@ def generate_pure_soft(model, tokenizer, **kwargs):
 
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
+    trace_topk = kwargs.pop("trace_topk", 0)
+    collapse_on_diffuse = kwargs.pop("collapse_on_diffuse", False)
+    collapse_entropy_window = kwargs.pop("collapse_entropy_window", 16)
+    collapse_entropy_alpha = kwargs.pop("collapse_entropy_alpha", 2.0)
+    collapse_min_history = kwargs.pop("collapse_min_history", 4)
+    collapse_min_entropy = kwargs.pop("collapse_min_entropy", 1.0)
+    collapse_low_conf_tau = kwargs.pop("collapse_low_conf_tau", 0.20)
+    collapse_low_margin_tau = kwargs.pop("collapse_low_margin_tau", 0.05)
+    collapse_min_step = kwargs.pop("collapse_min_step", 0)
+    collapse_patience = kwargs.pop("collapse_patience", 1)
+    collapse_patience_window = kwargs.pop("collapse_patience_window", 16)
+    collapse_require_repeat_degen = kwargs.pop("collapse_require_repeat_degen", False)
+    collapse_repeat_ngram = kwargs.pop("collapse_repeat_ngram", 0)
+    collapse_recent_repeat_window = kwargs.pop("collapse_recent_repeat_window", 32)
+    collapse_recent_repeat_tau = kwargs.pop("collapse_recent_repeat_tau", 0.0)
+    format_cooldown = kwargs.pop("format_cooldown", False)
+    format_cooldown_steps = kwargs.pop("format_cooldown_steps", 0)
+    answer_zone_discrete = kwargs.pop("answer_zone_discrete", False)
 
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids, device=input_ids.device)
@@ -279,10 +428,15 @@ def generate_pure_soft(model, tokenizer, **kwargs):
     batch_size, device = input_ids.shape[0], input_ids.device
     E = model.get_input_embeddings().weight
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
+    prompt_lens = [len(ids) for ids in all_generated]
     unfinished_idx = list(range(batch_size))
     past_key_values = None
     cache_position = torch.arange(input_ids.shape[1], device=device, dtype=torch.long)
     last_emb = None
+    entropy_history = [[] for _ in range(batch_size)]
+    collapse_candidate_history = [[] for _ in range(batch_size)]
+    format_cooldowns = [0 for _ in range(batch_size)]
+    answer_zone_active = [False for _ in range(batch_size)]
 
     for step in range(max_new_tokens):
         cur_batch = attention_mask.shape[0]
@@ -333,13 +487,108 @@ def generate_pure_soft(model, tokenizer, **kwargs):
 
         selected_prob = probs[torch.arange(cur_batch, device=device), next_tokens]
         raw_selected_prob = probs_original[torch.arange(cur_batch, device=device), next_tokens]
-        last_emb = torch.matmul(probs_original, E)
+        soft_emb = torch.matmul(probs_original, E)
+        normal_emb = E[next_tokens]
+        raw_top2 = torch.topk(probs_original, k=min(2, probs_original.shape[-1]), dim=-1).values
+        raw_top1_prob = raw_top2[:, 0]
+        raw_margin = (
+            raw_top2[:, 0] - raw_top2[:, 1]
+            if raw_top2.shape[-1] > 1
+            else raw_top2[:, 0]
+        )
+        collapse_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        format_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        answer_zone_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        answer_zone_trigger_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        entropy_delta = torch.zeros(cur_batch, dtype=raw_entropy.dtype, device=device)
+        entropy_history_count = torch.zeros(cur_batch, dtype=torch.long, device=device)
+        if collapse_on_diffuse:
+            spike_mask, entropy_delta, entropy_history_count = _entropy_spike_mask(
+                raw_entropy=raw_entropy,
+                entropy_history=entropy_history,
+                window=collapse_entropy_window,
+                alpha=collapse_entropy_alpha,
+                min_history=collapse_min_history,
+                min_entropy=collapse_min_entropy,
+            )
+            diffuse_mask = (
+                (raw_top1_prob < float(collapse_low_conf_tau))
+                | (raw_margin < float(collapse_low_margin_tau))
+            )
+            candidate_mask = spike_mask & diffuse_mask
+            if collapse_min_step > 0:
+                candidate_mask = candidate_mask & (step >= int(collapse_min_step))
+
+            refined_mask = torch.zeros_like(candidate_mask)
+            for bi, orig in enumerate(unfinished_idx):
+                if not bool(candidate_mask[bi].item()):
+                    continue
+
+                recent_candidates = (
+                    collapse_candidate_history[orig][-int(collapse_patience_window):]
+                    if collapse_patience_window > 0
+                    else collapse_candidate_history[orig]
+                )
+                enough_patience = (
+                    sum(recent_candidates) + 1 >= max(1, int(collapse_patience))
+                )
+                if not enough_patience:
+                    continue
+
+                generated_only = all_generated[orig][prompt_lens[orig]:]
+                repeat_degen = False
+                ngram = int(collapse_repeat_ngram)
+                if ngram > 0 and len(generated_only) >= ngram * 2:
+                    last_ngram = tuple(generated_only[-ngram:])
+                    prior = generated_only[:-ngram]
+                    repeat_degen = any(
+                        tuple(prior[i:i + ngram]) == last_ngram
+                        for i in range(0, len(prior) - ngram + 1)
+                    )
+
+                repeat_tau = float(collapse_recent_repeat_tau)
+                if repeat_tau > 0.0 and generated_only:
+                    window = max(1, int(collapse_recent_repeat_window))
+                    recent = generated_only[-window:]
+                    duplicate_ratio = 1.0 - (len(set(recent)) / max(1, len(recent)))
+                    repeat_degen = repeat_degen or (duplicate_ratio >= repeat_tau)
+
+                if collapse_require_repeat_degen and not repeat_degen:
+                    continue
+
+                refined_mask[bi] = True
+            collapse_mask = refined_mask
+        if format_cooldown and int(format_cooldown_steps) > 0:
+            for bi, orig in enumerate(unfinished_idx):
+                token_text = tokenizer.decode(
+                    [int(next_tokens[bi].item())],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                is_format = _is_format_token_text(token_text)
+                format_token_mask[bi] = is_format
+                format_mask[bi] = is_format or format_cooldowns[orig] > 0
+        if answer_zone_discrete:
+            for bi, orig in enumerate(unfinished_idx):
+                recent_ids = all_generated[orig][prompt_lens[orig]:] + [int(next_tokens[bi].item())]
+                recent_text = tokenizer.decode(
+                    recent_ids[-16:],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ).lower()
+                triggered = ("</think" in recent_text) or ("answer" in recent_text)
+                answer_zone_trigger_mask[bi] = triggered
+                answer_zone_mask[bi] = answer_zone_active[orig] or triggered
+
+        route_mask = collapse_mask | format_mask | answer_zone_mask
+        last_emb = torch.where(route_mask[:, None], normal_emb, soft_emb)
 
         for bi, orig in enumerate(unfinished_idx):
             token_id = next_tokens[bi].item()
             all_generated[orig].append(token_id)
             if token_trace is not None:
-                token_trace.append({
+                record = {
                     "step": int(step),
                     "batch_index": int(orig),
                     "token_id": int(token_id),
@@ -348,10 +597,49 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                     "selected_prob": float(selected_prob[bi].item()),
                     "raw_selected_prob": float(raw_selected_prob[bi].item()),
                     "confidence": float(selected_prob[bi].item()),
-                    "mode": "pure_soft",
-                })
+                    "mode": (
+                        "collapsed"
+                        if bool(collapse_mask[bi].item())
+                        else ("format_cooldown" if bool(format_mask[bi].item()) else "pure_soft")
+                    ),
+                        "collapse_on_diffuse": bool(collapse_mask[bi].item()),
+                        "format_cooldown_active": bool(format_mask[bi].item()),
+                        "format_token": bool(format_token_mask[bi].item()),
+                        "format_cooldown_remaining": int(format_cooldowns[orig]),
+                        "answer_zone_discrete_active": bool(answer_zone_mask[bi].item()),
+                        "answer_zone_trigger": bool(answer_zone_trigger_mask[bi].item()),
+                        "collapse_entropy_delta": float(entropy_delta[bi].item()),
+                    "collapse_entropy_history_count": int(entropy_history_count[bi].item()),
+                    "raw_top1_prob": float(raw_top1_prob[bi].item()),
+                    "raw_margin": float(raw_margin[bi].item()),
+                    "collapse_candidate": bool((spike_mask[bi] & diffuse_mask[bi]).item()) if collapse_on_diffuse else False,
+                }
+                _add_topk_trace_fields(
+                    record,
+                    tokenizer,
+                    probs_original,
+                    probs,
+                    bi,
+                    trace_topk,
+                )
+                token_trace.append(record)
             if stream_callback is not None:
                 stream_callback(all_generated[orig][-1])
+
+        for bi in range(cur_batch):
+            entropy_history[bi].append(float(raw_entropy[bi].item()))
+            if collapse_on_diffuse:
+                collapse_candidate_history[unfinished_idx[bi]].append(
+                    bool((spike_mask[bi] & diffuse_mask[bi]).item())
+                )
+            if format_cooldown and int(format_cooldown_steps) > 0:
+                orig = unfinished_idx[bi]
+                if bool(format_token_mask[bi].item()):
+                    format_cooldowns[orig] = max(0, int(format_cooldown_steps) - 1)
+                elif format_cooldowns[orig] > 0:
+                    format_cooldowns[orig] -= 1
+            if answer_zone_discrete and bool(answer_zone_trigger_mask[bi].item()):
+                answer_zone_active[unfinished_idx[bi]] = True
 
         if tokenizer.eos_token_id is not None:
             cur_finished = (next_tokens == tokenizer.eos_token_id)
@@ -365,6 +653,7 @@ def generate_pure_soft(model, tokenizer, **kwargs):
 
         last_emb = last_emb[keep_idx]
         attention_mask = attention_mask[keep_idx]
+        entropy_history = [entropy_history[i] for i in keep_idx.tolist()]
         keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
         if hasattr(past_key_values, "batch_select_indices"):
             past_key_values.batch_select_indices(keep_idx_tensor)
@@ -404,6 +693,11 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
     reanchor_min_step = kwargs.pop("reanchor_min_step", None)
     reanchor_max_step = kwargs.pop("reanchor_max_step", None)
     reanchor_anchor_mode = kwargs.pop("reanchor_anchor_mode", "dynamic")
+    reanchor_trigger_mode = kwargs.pop("reanchor_trigger_mode", "absolute")
+    reanchor_rolling_window = kwargs.pop("reanchor_rolling_window", 8)
+    reanchor_min_history = kwargs.pop("reanchor_min_history", 3)
+    reanchor_entropy_delta_threshold = kwargs.pop("reanchor_entropy_delta_threshold", 0.5)
+    reanchor_visual_drop_threshold = kwargs.pop("reanchor_visual_drop_threshold", 0.03)
 
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
@@ -426,6 +720,8 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
     last_emb = None
     trigger_count = torch.zeros(batch_size, dtype=torch.long, device=device)
     cooldown_remaining = torch.zeros(batch_size, dtype=torch.long, device=device)
+    entropy_history = [[] for _ in range(batch_size)]
+    visual_mass_history = [[] for _ in range(batch_size)]
 
     attn_config_values = _get_text_attn_implementation(model)
     _set_text_attn_implementation(attn_config_values, "eager")
@@ -497,6 +793,23 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
 
             next_emb = E[next_tokens]
             reanchor_triggered = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+            entropy_delta = torch.zeros(cur_batch, dtype=raw_entropy.dtype, device=device)
+            visual_drop = torch.zeros(cur_batch, dtype=raw_entropy.dtype, device=device)
+            entropy_history_count = torch.zeros(cur_batch, dtype=torch.long, device=device)
+            visual_history_count = torch.zeros(cur_batch, dtype=torch.long, device=device)
+
+            window_size = max(1, int(reanchor_rolling_window))
+            for bi in range(cur_batch):
+                ent_hist = entropy_history[bi][-window_size:]
+                entropy_history_count[bi] = len(ent_hist)
+                if ent_hist:
+                    prev_entropy = raw_entropy.new_tensor(ent_hist).mean()
+                    entropy_delta[bi] = raw_entropy[bi] - prev_entropy
+                vis_hist = visual_mass_history[bi][-window_size:]
+                visual_history_count[bi] = len(vis_hist)
+                if vis_hist and visual_attn_summary is not None:
+                    prev_visual = raw_entropy.new_tensor(vis_hist).mean()
+                    visual_drop[bi] = prev_visual - visual_attn_summary["mass"][bi].to(raw_entropy.device)
 
             if need_attn and outputs.attentions is not None:
                 trigger_mask = (raw_entropy >= float(reanchor_entropy_threshold))
@@ -507,6 +820,29 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
                     )
                 else:
                     trigger_mask = torch.zeros_like(trigger_mask)
+                if reanchor_trigger_mode == "absolute":
+                    pass
+                elif reanchor_trigger_mode == "entropy_delta":
+                    trigger_mask = trigger_mask & (entropy_history_count >= int(reanchor_min_history))
+                    trigger_mask = trigger_mask & (
+                        entropy_delta >= float(reanchor_entropy_delta_threshold)
+                    )
+                elif reanchor_trigger_mode == "visual_drop":
+                    trigger_mask = trigger_mask & (visual_history_count >= int(reanchor_min_history))
+                    trigger_mask = trigger_mask & (
+                        visual_drop >= float(reanchor_visual_drop_threshold)
+                    )
+                elif reanchor_trigger_mode == "entropy_delta_visual_drop":
+                    trigger_mask = trigger_mask & (entropy_history_count >= int(reanchor_min_history))
+                    trigger_mask = trigger_mask & (visual_history_count >= int(reanchor_min_history))
+                    trigger_mask = trigger_mask & (
+                        entropy_delta >= float(reanchor_entropy_delta_threshold)
+                    )
+                    trigger_mask = trigger_mask & (
+                        visual_drop >= float(reanchor_visual_drop_threshold)
+                    )
+                else:
+                    raise ValueError(f"Unsupported reanchor_trigger_mode: {reanchor_trigger_mode}")
                 if reanchor_min_step is not None:
                     trigger_mask = trigger_mask & (step >= int(reanchor_min_step))
                 if reanchor_max_step is not None:
@@ -557,6 +893,11 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
                         "mode": "normal",
                         "reanchor_triggered": bool(reanchor_triggered[bi].item()),
                         "reanchor_trigger_count": int(trigger_count[bi].item()),
+                        "reanchor_trigger_mode": reanchor_trigger_mode,
+                        "reanchor_entropy_delta": float(entropy_delta[bi].item()),
+                        "reanchor_visual_drop": float(visual_drop[bi].item()),
+                        "reanchor_entropy_history_count": int(entropy_history_count[bi].item()),
+                        "reanchor_visual_history_count": int(visual_history_count[bi].item()),
                     }
                     if log_visual_attn_summary and visual_attn_summary is None:
                         record.update({
@@ -584,6 +925,11 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
                 if stream_callback is not None:
                     stream_callback(all_generated[orig][-1])
 
+            for bi in range(cur_batch):
+                entropy_history[bi].append(float(raw_entropy[bi].item()))
+                if visual_attn_summary is not None and visual_attn_summary["available"][bi].item():
+                    visual_mass_history[bi].append(float(visual_attn_summary["mass"][bi].item()))
+
             if tokenizer.eos_token_id is not None:
                 cur_finished = (next_tokens == tokenizer.eos_token_id)
             else:
@@ -602,6 +948,8 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
             prompt_hidden_states = prompt_hidden_states[keep_idx]
             trigger_count = trigger_count[keep_idx]
             cooldown_remaining = cooldown_remaining[keep_idx]
+            entropy_history = [entropy_history[i] for i in keep_idx.tolist()]
+            visual_mass_history = [visual_mass_history[i] for i in keep_idx.tolist()]
             keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
             if hasattr(past_key_values, "batch_select_indices"):
                 past_key_values.batch_select_indices(keep_idx_tensor)
@@ -649,6 +997,19 @@ def generate_lead(model, tokenizer, **kwargs):
 
     stream_callback       = kwargs.pop("stream_callback", None)
     token_trace           = kwargs.pop("token_trace", None)
+    trace_topk            = kwargs.pop("trace_topk", 0)
+    lead_soft_veto_on_diffuse = kwargs.pop("lead_soft_veto_on_diffuse", False)
+    lead_veto_entropy_window = kwargs.pop("lead_veto_entropy_window", 16)
+    lead_veto_entropy_alpha = kwargs.pop("lead_veto_entropy_alpha", 2.0)
+    lead_veto_min_history = kwargs.pop("lead_veto_min_history", 4)
+    lead_veto_min_entropy = kwargs.pop("lead_veto_min_entropy", 1.0)
+    lead_veto_low_conf_tau = kwargs.pop("lead_veto_low_conf_tau", 0.20)
+    lead_veto_low_margin_tau = kwargs.pop("lead_veto_low_margin_tau", 0.05)
+    lead_veto_min_step = kwargs.pop("lead_veto_min_step", 64)
+    lead_veto_require_repeat_degen = kwargs.pop("lead_veto_require_repeat_degen", True)
+    lead_veto_repeat_ngram = kwargs.pop("lead_veto_repeat_ngram", 3)
+    lead_veto_recent_repeat_window = kwargs.pop("lead_veto_recent_repeat_window", 32)
+    lead_veto_recent_repeat_tau = kwargs.pop("lead_veto_recent_repeat_tau", 0.35)
 
     # ============================================
 
@@ -689,10 +1050,12 @@ def generate_lead(model, tokenizer, **kwargs):
     cache_position = torch.arange(input_ids.shape[1], device=device, dtype=torch.long)
         
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
+    prompt_lens = [len(ids) for ids in all_generated]
     unfinished_idx = list(range(batch_size)) # bs >= 1 is supported
     mode = torch.zeros(batch_size, dtype=torch.long, device=device)  # 0: soft, 1: normal
     mode_stay_steps = torch.zeros(batch_size, dtype=torch.long, device=device)
     locked_normal_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    entropy_history = [[] for _ in range(batch_size)]
     
     if max_switch_count is not None:
         switch_count = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -796,6 +1159,51 @@ def generate_lead(model, tokenizer, **kwargs):
         
         normal_emb = E[next_tokens]
         soft_emb = torch.matmul(probs_original, E)
+        raw_top2 = torch.topk(probs_original, k=min(2, probs_original.shape[-1]), dim=-1).values
+        raw_top1_prob = raw_top2[:, 0]
+        raw_margin = (
+            raw_top2[:, 0] - raw_top2[:, 1]
+            if raw_top2.shape[-1] > 1
+            else raw_top2[:, 0]
+        )
+        lead_soft_veto_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        lead_veto_candidate = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        if lead_soft_veto_on_diffuse:
+            spike_mask, _, _ = _entropy_spike_mask(
+                raw_entropy=cur_entropy,
+                entropy_history=entropy_history,
+                window=lead_veto_entropy_window,
+                alpha=lead_veto_entropy_alpha,
+                min_history=lead_veto_min_history,
+                min_entropy=lead_veto_min_entropy,
+            )
+            diffuse_mask = (
+                (raw_top1_prob < float(lead_veto_low_conf_tau))
+                | (raw_margin < float(lead_veto_low_margin_tau))
+            )
+            lead_veto_candidate = spike_mask & diffuse_mask & (step >= int(lead_veto_min_step))
+            for bi, orig in enumerate(unfinished_idx):
+                if not bool(lead_veto_candidate[bi].item()):
+                    continue
+                generated_only = all_generated[orig][prompt_lens[orig]:]
+                repeat_degen = False
+                ngram = int(lead_veto_repeat_ngram)
+                if ngram > 0 and len(generated_only) >= ngram * 2:
+                    last_ngram = tuple(generated_only[-ngram:])
+                    prior = generated_only[:-ngram]
+                    repeat_degen = any(
+                        tuple(prior[i:i + ngram]) == last_ngram
+                        for i in range(0, len(prior) - ngram + 1)
+                    )
+                repeat_tau = float(lead_veto_recent_repeat_tau)
+                if repeat_tau > 0.0 and generated_only:
+                    window = max(1, int(lead_veto_recent_repeat_window))
+                    recent = generated_only[-window:]
+                    duplicate_ratio = 1.0 - (len(set(recent)) / max(1, len(recent)))
+                    repeat_degen = repeat_degen or (duplicate_ratio >= repeat_tau)
+                if lead_veto_require_repeat_degen and not repeat_degen:
+                    continue
+                lead_soft_veto_mask[bi] = True
 
         alpha = alpha_0 + (1 - alpha_0) * float(step) / float(max_new_tokens)
         if step == 0:
@@ -813,6 +1221,7 @@ def generate_lead(model, tokenizer, **kwargs):
         if step > 0:
             mixed_emb = beta * soft_emb + (1 - beta) * end_thinking_emb
             normal_emb = torch.where(to_normal[:, None], mixed_emb, normal_emb)
+        is_soft = is_soft & (~lead_soft_veto_mask)
         last_emb = torch.where(is_soft[:, None], soft_emb, normal_emb)
 
         if max_switch_count is not None and step > 0:
@@ -848,19 +1257,34 @@ def generate_lead(model, tokenizer, **kwargs):
             token_id = next_tokens[bi].item()
             all_generated[orig].append(token_id)
             if token_trace is not None:
-                token_trace.append({
+                record = {
                     "step": int(step),
                     "batch_index": int(orig),
                     "token_id": int(token_id),
                     "raw_entropy": float(cur_entropy[bi].item()),
                     "filtered_entropy": float(filtered_entropy[bi].item()),
-                    "selected_prob": float(probs[bi, next_tokens[bi]].item()),
-                    "mode": "soft" if bool(is_soft[bi].item()) else "normal",
-                    "alpha": float(alpha),
-                    "beta": float(beta),
-                })
+                        "selected_prob": float(probs[bi, next_tokens[bi]].item()),
+                        "mode": "soft" if bool(is_soft[bi].item()) else "normal",
+                        "lead_soft_veto": bool(lead_soft_veto_mask[bi].item()),
+                        "lead_veto_candidate": bool(lead_veto_candidate[bi].item()),
+                        "raw_top1_prob": float(raw_top1_prob[bi].item()),
+                        "raw_margin": float(raw_margin[bi].item()),
+                        "alpha": float(alpha),
+                        "beta": float(beta),
+                    }
+                _add_topk_trace_fields(
+                    record,
+                    tokenizer,
+                    probs_original,
+                    probs,
+                    bi,
+                    trace_topk,
+                )
+                token_trace.append(record)
             if stream_callback is not None:
                 stream_callback(all_generated[orig][-1])
+        for bi in range(cur_batch):
+            entropy_history[bi].append(float(cur_entropy[bi].item()))
         
         if tokenizer.eos_token_id is not None:
             cur_finished = (next_tokens == tokenizer.eos_token_id)
@@ -881,6 +1305,7 @@ def generate_lead(model, tokenizer, **kwargs):
         mode_stay_steps = mode_stay_steps[keep_idx]
         cur_ref_entropy = cur_ref_entropy[keep_idx]
         locked_normal_mask = locked_normal_mask[keep_idx]
+        entropy_history = [entropy_history[i] for i in keep_idx.tolist()]
         if hasattr(past_key_values, "batch_select_indices"):
             keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
             past_key_values.batch_select_indices(keep_idx_tensor)
@@ -1008,6 +1433,141 @@ def _compute_dynamic_visual_anchor(
     return anchors, has_anchor
 
 
+def _observe_sidecar_visual_attention(
+    model,
+    tokenizer,
+    generated_ids,
+    prompt_len,
+    visual_token_mask,
+    vision_inputs,
+    device,
+    attn_last_k,
+):
+    """Replay a fixed prefix with eager attention without touching main-path KV."""
+    if len(generated_ids) <= prompt_len:
+        return {
+            "sidecar_attn_observed": False,
+            "sidecar_attn_error_type": "NoGeneratedToken",
+            "sidecar_attn_error_message": "No generated token available for sidecar replay.",
+        }
+
+    prefix_ids = torch.tensor([generated_ids[:-1]], dtype=torch.long, device=device)
+    cur_ids = torch.tensor([[generated_ids[-1]]], dtype=torch.long, device=device)
+    prefix_attention_mask = torch.ones_like(prefix_ids, device=device)
+    cur_attention_mask = torch.ones((1, prefix_ids.shape[1] + 1), dtype=torch.long, device=device)
+    prefix_cache_position = torch.arange(prefix_ids.shape[1], device=device, dtype=torch.long)
+    cur_cache_position = torch.tensor([prefix_ids.shape[1]], device=device, dtype=torch.long)
+
+    attn_config_values = _get_text_attn_implementation(model)
+    _set_text_attn_implementation(attn_config_values, "eager")
+    try:
+        replay_inputs = {
+            "input_ids": prefix_ids,
+            "attention_mask": prefix_attention_mask,
+            "use_cache": True,
+            "output_attentions": False,
+            "output_hidden_states": True,
+            "return_dict": True,
+            "cache_position": prefix_cache_position,
+        }
+        replay_inputs.update(vision_inputs)
+        with torch.no_grad():
+            prefix_outputs = model(**replay_inputs)
+            outputs = model(
+                input_ids=cur_ids,
+                attention_mask=cur_attention_mask,
+                past_key_values=prefix_outputs.past_key_values,
+                use_cache=True,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+                cache_position=cur_cache_position,
+            )
+        summary = _summarize_visual_attention(
+            attn_layers=outputs.attentions,
+            visual_token_mask=visual_token_mask,
+            prompt_len=prompt_len,
+            attn_last_k=attn_last_k,
+        )
+        alignment = _summarize_hidden_visual_alignment(
+            current_hidden=outputs.hidden_states[-1][:, -1, :],
+            prompt_hidden_states=prefix_outputs.hidden_states[-1][:, :prompt_len, :],
+            visual_token_mask=visual_token_mask,
+            top_k=4,
+        )
+    finally:
+        _restore_text_attn_implementation(attn_config_values)
+
+    available = bool(summary["available"][0].item())
+    align_available = bool(alignment["available"][0].item())
+    return {
+        "sidecar_attn_observed": True,
+        "sidecar_attn_error_type": None,
+        "sidecar_attn_error_message": None,
+        "sidecar_visual_attn_available": available,
+        "sidecar_visual_attn_mass": float(summary["mass"][0].item()),
+        "sidecar_visual_attn_top1": float(summary["top1"][0].item()),
+        "sidecar_visual_attn_top4_sum": float(summary["top4_sum"][0].item()),
+        "sidecar_visual_attn_entropy": (
+            float(summary["entropy"][0].item()) if available else None
+        ),
+        "sidecar_visual_attn_entropy_norm": (
+            float(summary["entropy_norm"][0].item()) if available else None
+        ),
+        "sidecar_visual_attn_concentration": (
+            float(summary["concentration"][0].item()) if available else None
+        ),
+        "sidecar_visual_attn_token_count": int(summary["token_count"][0].item()),
+        "sidecar_hidden_visual_align_available": align_available,
+        "sidecar_hidden_visual_align_max": (
+            float(alignment["max"][0].item()) if align_available else None
+        ),
+        "sidecar_hidden_visual_align_top4_mean": (
+            float(alignment["topk_mean"][0].item()) if align_available else None
+        ),
+        "sidecar_hidden_visual_align_token_count": int(alignment["token_count"][0].item()),
+    }
+
+
+def _summarize_hidden_visual_alignment(
+    current_hidden,
+    prompt_hidden_states,
+    visual_token_mask,
+    top_k=4,
+):
+    device = current_hidden.device
+    visual_token_mask = visual_token_mask.to(device)
+    prompt_hidden_states = prompt_hidden_states.to(device)
+    batch_size = current_hidden.shape[0]
+    available = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    max_sim = torch.zeros(batch_size, dtype=current_hidden.dtype, device=device)
+    topk_mean = torch.zeros(batch_size, dtype=current_hidden.dtype, device=device)
+    token_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    current_norm = F.normalize(current_hidden, dim=-1)
+    visual_norm = F.normalize(prompt_hidden_states, dim=-1)
+    for bi in range(batch_size):
+        visual_positions = visual_token_mask[bi, : prompt_hidden_states.shape[1]].nonzero(as_tuple=False).squeeze(-1)
+        if visual_positions.numel() == 0:
+            continue
+        sims = torch.matmul(visual_norm[bi, visual_positions, :], current_norm[bi])
+        cur_top_k = min(int(top_k), int(sims.numel()))
+        if cur_top_k <= 0:
+            continue
+        top_vals = torch.topk(sims, k=cur_top_k, dim=0).values
+        available[bi] = True
+        token_count[bi] = int(visual_positions.numel())
+        max_sim[bi] = top_vals[0]
+        topk_mean[bi] = top_vals.mean()
+
+    return {
+        "available": available,
+        "max": max_sim,
+        "topk_mean": topk_mean,
+        "token_count": token_count,
+    }
+
+
 def _summarize_visual_attention(
     attn_layers,
     visual_token_mask,
@@ -1048,6 +1608,8 @@ def _summarize_visual_attention(
     top1 = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
     top4_sum = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
     entropy = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    entropy_norm = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
+    concentration = torch.zeros(batch_size, dtype=current_attn.dtype, device=device)
     token_count = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     visual_token_mask = visual_token_mask.to(device)
@@ -1067,6 +1629,9 @@ def _summarize_visual_attention(
             entropy[bi] = -(
                 norm_scores * norm_scores.clamp(min=1e-8).log()
             ).sum()
+            if visual_positions.numel() > 1:
+                entropy_norm[bi] = entropy[bi] / math.log(float(visual_positions.numel()))
+                concentration[bi] = 1.0 - entropy_norm[bi]
 
     return {
         "available": available,
@@ -1074,6 +1639,8 @@ def _summarize_visual_attention(
         "top1": top1,
         "top4_sum": top4_sum,
         "entropy": entropy,
+        "entropy_norm": entropy_norm,
+        "concentration": concentration,
         "token_count": token_count,
     }
 

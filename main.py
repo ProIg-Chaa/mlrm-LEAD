@@ -428,6 +428,9 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 最大切换次数")
     parser.add_argument("--window_size", type=int, default=256,
                         help="LEAD 离散到潜在模式切换的最小持续步数")
+    parser.add_argument("--cot_prompt_mode", type=str, default="orign",
+                        choices=["orign", "step"],
+                        help="cot/cot_greedy 的 prompt 口径：orign 对齐原项目不追加 CoT 指令；step 追加 step-by-step 指令")
     parser.add_argument("--visual_anchor_top_m", type=int, default=32,
                         help="lead_attenachor 中按当前 token 对视觉 token attention 选取的 top-m")
     parser.add_argument("--visual_anchor_attn_last_k", type=int, default=4,
@@ -461,6 +464,64 @@ def parse_args() -> argparse.Namespace:
                         help="首次 soft->normal 后，将 cur_ref_entropy 重置为当前熵加该边际")
     parser.add_argument("--soft_post_reset_cooldown", type=int, default=0,
                         help="首次 soft->normal 后，额外增加的冷却步数")
+    parser.add_argument("--pure_soft_collapse_on_diffuse", action="store_true",
+                        help="pure_soft 中当 token 为扩散型高熵 spike 时，将下一步输入坍缩为离散 token embedding")
+    parser.add_argument("--collapse_entropy_window", type=int, default=16,
+                        help="pure_soft 扩散坍缩使用的局部 entropy 历史窗口")
+    parser.add_argument("--collapse_entropy_alpha", type=float, default=2.0,
+                        help="pure_soft 扩散坍缩的局部突跃阈值系数")
+    parser.add_argument("--collapse_min_history", type=int, default=4,
+                        help="pure_soft 扩散坍缩所需最少历史 token 数")
+    parser.add_argument("--collapse_min_entropy", type=float, default=1.0,
+                        help="pure_soft 扩散坍缩所需当前 raw entropy 下限")
+    parser.add_argument("--collapse_low_conf_tau", type=float, default=0.20,
+                        help="pure_soft 扩散坍缩的 raw top1 低置信阈值")
+    parser.add_argument("--collapse_low_margin_tau", type=float, default=0.05,
+                        help="pure_soft 扩散坍缩的 raw top1-top2 margin 阈值")
+    parser.add_argument("--collapse_min_step", type=int, default=0,
+                        help="pure_soft 扩散坍缩允许触发的最早生成步数")
+    parser.add_argument("--collapse_patience", type=int, default=1,
+                        help="pure_soft 扩散坍缩在近邻窗口内所需候选触发次数")
+    parser.add_argument("--collapse_patience_window", type=int, default=16,
+                        help="pure_soft 扩散坍缩 patience 统计窗口")
+    parser.add_argument("--collapse_require_repeat_degen", action="store_true",
+                        help="pure_soft 扩散坍缩要求最近输出已出现重复退化迹象")
+    parser.add_argument("--collapse_repeat_ngram", type=int, default=0,
+                        help="pure_soft 重复退化 gate 使用的 ngram 长度，0 表示关闭")
+    parser.add_argument("--collapse_recent_repeat_window", type=int, default=32,
+                        help="pure_soft 重复退化 gate 使用的最近 token 窗口")
+    parser.add_argument("--collapse_recent_repeat_tau", type=float, default=0.0,
+                        help="pure_soft 最近 token 重复率阈值，0 表示关闭")
+    parser.add_argument("--pure_soft_format_cooldown", action="store_true",
+                        help="pure_soft 中命中格式 token 后，若干步强制使用离散 token embedding")
+    parser.add_argument("--format_cooldown_steps", type=int, default=0,
+                        help="pure_soft 格式 token cooldown 步数，0 表示关闭")
+    parser.add_argument("--pure_soft_answer_zone_discrete", action="store_true",
+                        help="pure_soft 中进入答案区后强制使用离散 token embedding")
+    parser.add_argument("--lead_soft_veto_on_diffuse", action="store_true",
+                        help="LEAD 中当 soft 步满足低置信扩散和退化 gate 时，当前步改用离散 embedding")
+    parser.add_argument("--lead_veto_entropy_window", type=int, default=16,
+                        help="LEAD soft veto 使用的局部 entropy 历史窗口")
+    parser.add_argument("--lead_veto_entropy_alpha", type=float, default=2.0,
+                        help="LEAD soft veto 的局部突跃阈值系数")
+    parser.add_argument("--lead_veto_min_history", type=int, default=4,
+                        help="LEAD soft veto 所需最少历史 token 数")
+    parser.add_argument("--lead_veto_min_entropy", type=float, default=1.0,
+                        help="LEAD soft veto 所需当前 raw entropy 下限")
+    parser.add_argument("--lead_veto_low_conf_tau", type=float, default=0.20,
+                        help="LEAD soft veto 的 raw top1 低置信阈值")
+    parser.add_argument("--lead_veto_low_margin_tau", type=float, default=0.05,
+                        help="LEAD soft veto 的 raw top1-top2 margin 阈值")
+    parser.add_argument("--lead_veto_min_step", type=int, default=64,
+                        help="LEAD soft veto 允许触发的最早生成步数")
+    parser.add_argument("--lead_veto_require_repeat_degen", action="store_true",
+                        help="LEAD soft veto 要求最近输出已出现重复退化迹象")
+    parser.add_argument("--lead_veto_repeat_ngram", type=int, default=3,
+                        help="LEAD soft veto 重复退化 gate 使用的 ngram 长度")
+    parser.add_argument("--lead_veto_recent_repeat_window", type=int, default=32,
+                        help="LEAD soft veto 最近 token 重复率窗口")
+    parser.add_argument("--lead_veto_recent_repeat_tau", type=float, default=0.35,
+                        help="LEAD soft veto 最近 token 重复率阈值")
     parser.add_argument("--reanchor_entropy_threshold", type=float, default=1.0,
                         help="cot_visual_reanchor 中触发视觉增强的 raw entropy 下限")
     parser.add_argument("--reanchor_visual_attn_threshold", type=float, default=0.12,
@@ -482,6 +543,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reanchor_anchor_mode", type=str, default="dynamic",
                         choices=["dynamic", "mean"],
                         help="cot_visual_reanchor 中 top-m 视觉 token 的聚合方式：dynamic 为原 latent 加权，mean 为简单平均")
+    parser.add_argument("--reanchor_trigger_mode", type=str, default="absolute",
+                        choices=["absolute", "entropy_delta", "visual_drop", "entropy_delta_visual_drop"],
+                        help="cot_visual_reanchor 触发策略：absolute 为原固定阈值，其他模式加入 rolling 熵突升/视觉注意力下降条件")
+    parser.add_argument("--reanchor_rolling_window", type=int, default=8,
+                        help="adaptive reanchor 触发使用的 rolling 历史窗口大小")
+    parser.add_argument("--reanchor_min_history", type=int, default=3,
+                        help="adaptive reanchor 触发所需的最少历史 token 数")
+    parser.add_argument("--reanchor_entropy_delta_threshold", type=float, default=0.5,
+                        help="entropy_delta 模式下 H_t - rolling_mean(H) 的阈值")
+    parser.add_argument("--reanchor_visual_drop_threshold", type=float, default=0.03,
+                        help="visual_drop 模式下 rolling_mean(visual_attn_mass) - current_mass 的阈值")
     parser.add_argument(
         "--save_token_entropy",
         action="store_true",
@@ -493,6 +565,12 @@ def parse_args() -> argparse.Namespace:
         help="保存完整逐 token 熵轨迹到 token_entropy_full.jsonl，便于画曲线",
     )
     parser.add_argument(
+        "--trace_topk",
+        type=int,
+        default=0,
+        help="在完整 token 熵轨迹中额外记录每步 raw/filtered top-k 候选；0 表示关闭",
+    )
+    parser.add_argument(
         "--save_visual_attn_summary",
         action="store_true",
         help="在 cot/cot_greedy 推理时为每个生成 token 记录视觉注意力摘要",
@@ -502,6 +580,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="视觉注意力摘要聚合时使用最后几层 attention；<=0 表示使用全部层",
+    )
+    parser.add_argument(
+        "--sidecar_attn_on_entropy",
+        action="store_true",
+        help="主 COT 路径保持干净；仅当 token 熵超过阈值时临时旁路 replay 记录视觉 attention",
+    )
+    parser.add_argument(
+        "--sidecar_attn_entropy_threshold",
+        type=float,
+        default=2.0,
+        help="触发在线旁路 attention replay 的 raw entropy 阈值",
+    )
+    parser.add_argument(
+        "--sidecar_attn_last_k",
+        type=int,
+        default=4,
+        help="在线旁路 attention 摘要聚合的最后几层；<=0 表示使用全部层",
     )
 
     # ---- 采样参数 ----
@@ -646,6 +741,7 @@ def main():
         "alpha": args.alpha,
         "max_switch_count": args.max_switch_count,
         "window_size": args.window_size,
+        "cot_prompt_mode": args.cot_prompt_mode,
         "visual_anchor_top_m": args.visual_anchor_top_m,
         "visual_anchor_attn_last_k": args.visual_anchor_attn_last_k,
         "visual_anchor_lambda_scale": args.visual_anchor_lambda_scale,
@@ -662,6 +758,35 @@ def main():
         "soft_repeat_cooldown": args.soft_repeat_cooldown,
         "soft_post_reset_ref_margin": args.soft_post_reset_ref_margin,
         "soft_post_reset_cooldown": args.soft_post_reset_cooldown,
+        "pure_soft_collapse_on_diffuse": args.pure_soft_collapse_on_diffuse,
+        "collapse_entropy_window": args.collapse_entropy_window,
+        "collapse_entropy_alpha": args.collapse_entropy_alpha,
+        "collapse_min_history": args.collapse_min_history,
+        "collapse_min_entropy": args.collapse_min_entropy,
+        "collapse_low_conf_tau": args.collapse_low_conf_tau,
+        "collapse_low_margin_tau": args.collapse_low_margin_tau,
+        "collapse_min_step": args.collapse_min_step,
+        "collapse_patience": args.collapse_patience,
+        "collapse_patience_window": args.collapse_patience_window,
+        "collapse_require_repeat_degen": args.collapse_require_repeat_degen,
+        "collapse_repeat_ngram": args.collapse_repeat_ngram,
+        "collapse_recent_repeat_window": args.collapse_recent_repeat_window,
+        "collapse_recent_repeat_tau": args.collapse_recent_repeat_tau,
+        "pure_soft_format_cooldown": args.pure_soft_format_cooldown,
+        "format_cooldown_steps": args.format_cooldown_steps,
+        "pure_soft_answer_zone_discrete": args.pure_soft_answer_zone_discrete,
+        "lead_soft_veto_on_diffuse": args.lead_soft_veto_on_diffuse,
+        "lead_veto_entropy_window": args.lead_veto_entropy_window,
+        "lead_veto_entropy_alpha": args.lead_veto_entropy_alpha,
+        "lead_veto_min_history": args.lead_veto_min_history,
+        "lead_veto_min_entropy": args.lead_veto_min_entropy,
+        "lead_veto_low_conf_tau": args.lead_veto_low_conf_tau,
+        "lead_veto_low_margin_tau": args.lead_veto_low_margin_tau,
+        "lead_veto_min_step": args.lead_veto_min_step,
+        "lead_veto_require_repeat_degen": args.lead_veto_require_repeat_degen,
+        "lead_veto_repeat_ngram": args.lead_veto_repeat_ngram,
+        "lead_veto_recent_repeat_window": args.lead_veto_recent_repeat_window,
+        "lead_veto_recent_repeat_tau": args.lead_veto_recent_repeat_tau,
         "reanchor_entropy_threshold": args.reanchor_entropy_threshold,
         "reanchor_visual_attn_threshold": args.reanchor_visual_attn_threshold,
         "reanchor_lambda": args.reanchor_lambda,
@@ -672,6 +797,11 @@ def main():
         "reanchor_min_step": args.reanchor_min_step,
         "reanchor_max_step": args.reanchor_max_step,
         "reanchor_anchor_mode": args.reanchor_anchor_mode,
+        "reanchor_trigger_mode": args.reanchor_trigger_mode,
+        "reanchor_rolling_window": args.reanchor_rolling_window,
+        "reanchor_min_history": args.reanchor_min_history,
+        "reanchor_entropy_delta_threshold": args.reanchor_entropy_delta_threshold,
+        "reanchor_visual_drop_threshold": args.reanchor_visual_drop_threshold,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -681,8 +811,12 @@ def main():
         "num_samples": len(dataset),
         "save_token_entropy": args.save_token_entropy,
         "save_full_token_entropy": args.save_full_token_entropy,
+        "trace_topk": args.trace_topk,
         "save_visual_attn_summary": args.save_visual_attn_summary,
         "visual_attn_summary_last_k": args.visual_attn_summary_last_k,
+        "sidecar_attn_on_entropy": args.sidecar_attn_on_entropy,
+        "sidecar_attn_entropy_threshold": args.sidecar_attn_entropy_threshold,
+        "sidecar_attn_last_k": args.sidecar_attn_last_k,
     }
     if args.save_token_entropy:
         config["token_entropy_path"] = token_entropy_path
@@ -697,7 +831,10 @@ def main():
     for idx, sample in enumerate(dataset):
         prompt = format_prompt_from_sample(
             sample,
-            use_cot=args.method in {"cot", "cot_greedy"},
+            use_cot=(
+                args.method in {"cot", "cot_greedy"}
+                and args.cot_prompt_mode == "step"
+            ),
         )
         image_url = sample.get("image", "")
 

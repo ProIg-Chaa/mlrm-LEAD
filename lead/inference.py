@@ -127,9 +127,14 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
     }
     if args.token_entropy_trace is not None:
         gen_kwargs["token_trace"] = args.token_entropy_trace
+        gen_kwargs["trace_topk"] = getattr(args, "trace_topk", 0)
     if getattr(args, "save_visual_attn_summary", False):
         gen_kwargs["log_visual_attn_summary"] = True
         gen_kwargs["visual_attn_summary_last_k"] = args.visual_attn_summary_last_k
+    if getattr(args, "sidecar_attn_on_entropy", False):
+        gen_kwargs["sidecar_attn_on_entropy"] = True
+        gen_kwargs["sidecar_attn_entropy_threshold"] = args.sidecar_attn_entropy_threshold
+        gen_kwargs["sidecar_attn_last_k"] = args.sidecar_attn_last_k
     if args.method == "cot_visual_reanchor":
         gen_kwargs["reanchor_entropy_threshold"] = args.reanchor_entropy_threshold
         gen_kwargs["reanchor_visual_attn_threshold"] = args.reanchor_visual_attn_threshold
@@ -141,6 +146,11 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
         gen_kwargs["reanchor_min_step"] = args.reanchor_min_step
         gen_kwargs["reanchor_max_step"] = args.reanchor_max_step
         gen_kwargs["reanchor_anchor_mode"] = args.reanchor_anchor_mode
+        gen_kwargs["reanchor_trigger_mode"] = args.reanchor_trigger_mode
+        gen_kwargs["reanchor_rolling_window"] = args.reanchor_rolling_window
+        gen_kwargs["reanchor_min_history"] = args.reanchor_min_history
+        gen_kwargs["reanchor_entropy_delta_threshold"] = args.reanchor_entropy_delta_threshold
+        gen_kwargs["reanchor_visual_drop_threshold"] = args.reanchor_visual_drop_threshold
 
     if args.method == "cot_greedy":
         gen_kwargs["do_sample"] = False
@@ -153,6 +163,18 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["max_switch_count"] = args.max_switch_count
             model_inputs["window_size"] = args.window_size
             model_inputs["convergence_words"] = "</think>"
+            model_inputs["lead_soft_veto_on_diffuse"] = args.lead_soft_veto_on_diffuse
+            model_inputs["lead_veto_entropy_window"] = args.lead_veto_entropy_window
+            model_inputs["lead_veto_entropy_alpha"] = args.lead_veto_entropy_alpha
+            model_inputs["lead_veto_min_history"] = args.lead_veto_min_history
+            model_inputs["lead_veto_min_entropy"] = args.lead_veto_min_entropy
+            model_inputs["lead_veto_low_conf_tau"] = args.lead_veto_low_conf_tau
+            model_inputs["lead_veto_low_margin_tau"] = args.lead_veto_low_margin_tau
+            model_inputs["lead_veto_min_step"] = args.lead_veto_min_step
+            model_inputs["lead_veto_require_repeat_degen"] = args.lead_veto_require_repeat_degen
+            model_inputs["lead_veto_repeat_ngram"] = args.lead_veto_repeat_ngram
+            model_inputs["lead_veto_recent_repeat_window"] = args.lead_veto_recent_repeat_window
+            model_inputs["lead_veto_recent_repeat_tau"] = args.lead_veto_recent_repeat_tau
             outputs = generate_lead(
                 model,
                 tokenizer,
@@ -189,6 +211,23 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
                 **gen_kwargs,
             )
         elif args.method == "pure_soft":
+            model_inputs["collapse_on_diffuse"] = getattr(args, "pure_soft_collapse_on_diffuse", False)
+            model_inputs["collapse_entropy_window"] = args.collapse_entropy_window
+            model_inputs["collapse_entropy_alpha"] = args.collapse_entropy_alpha
+            model_inputs["collapse_min_history"] = args.collapse_min_history
+            model_inputs["collapse_min_entropy"] = args.collapse_min_entropy
+            model_inputs["collapse_low_conf_tau"] = args.collapse_low_conf_tau
+            model_inputs["collapse_low_margin_tau"] = args.collapse_low_margin_tau
+            model_inputs["collapse_min_step"] = args.collapse_min_step
+            model_inputs["collapse_patience"] = args.collapse_patience
+            model_inputs["collapse_patience_window"] = args.collapse_patience_window
+            model_inputs["collapse_require_repeat_degen"] = args.collapse_require_repeat_degen
+            model_inputs["collapse_repeat_ngram"] = args.collapse_repeat_ngram
+            model_inputs["collapse_recent_repeat_window"] = args.collapse_recent_repeat_window
+            model_inputs["collapse_recent_repeat_tau"] = args.collapse_recent_repeat_tau
+            model_inputs["format_cooldown"] = args.pure_soft_format_cooldown
+            model_inputs["format_cooldown_steps"] = args.format_cooldown_steps
+            model_inputs["answer_zone_discrete"] = args.pure_soft_answer_zone_discrete
             outputs = generate_pure_soft(
                 model,
                 tokenizer,
