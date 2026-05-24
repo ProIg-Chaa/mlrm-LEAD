@@ -428,6 +428,8 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 最大切换次数")
     parser.add_argument("--window_size", type=int, default=256,
                         help="LEAD 离散到潜在模式切换的最小持续步数")
+    parser.add_argument("--lead_disable_simple_visual_anchor", action="store_true",
+                        help="LEAD 消融：不把 <think> anchor 替换为 <|image_pad|> embedding")
     parser.add_argument("--cot_prompt_mode", type=str, default="orign",
                         choices=["orign", "step"],
                         help="cot/cot_greedy 的 prompt 口径：orign 对齐原项目不追加 CoT 指令；step 追加 step-by-step 指令")
@@ -496,8 +498,36 @@ def parse_args() -> argparse.Namespace:
                         help="pure_soft 中命中格式 token 后，若干步强制使用离散 token embedding")
     parser.add_argument("--format_cooldown_steps", type=int, default=0,
                         help="pure_soft 格式 token cooldown 步数，0 表示关闭")
+    parser.add_argument("--format_cooldown_min_step", type=int, default=0,
+                        help="pure_soft 格式 token cooldown 允许触发的最早生成步数")
+    parser.add_argument("--format_cooldown_highrisk_only", action="store_true",
+                        help="pure_soft 格式 cooldown 只在 answer/think/括号/冒号等高危结构 token 上触发")
+    parser.add_argument("--format_cooldown_normal_steps", type=int, default=None,
+                        help="pure_soft 普通格式 token 的 cooldown 步数；默认沿用 format_cooldown_steps")
+    parser.add_argument("--format_cooldown_highrisk_steps", type=int, default=None,
+                        help="pure_soft 高危结构格式 token 的 cooldown 步数；默认沿用 format_cooldown_steps")
+    parser.add_argument("--format_cooldown_mix_lambda", type=float, default=1.0,
+                        help="pure_soft 格式 cooldown 的离散混合强度，1.0 为全离散，0.0 为纯 soft")
+    parser.add_argument("--format_cooldown_max_active", type=int, default=0,
+                        help="pure_soft 每个样本最多允许多少个 token 进入 format cooldown，0 表示不限制")
+    parser.add_argument("--format_cooldown_entropy_min", type=float, default=None,
+                        help="pure_soft 格式 cooldown 仅在 raw entropy 不低于该值时触发；可与 top1/margin gate 取 OR")
+    parser.add_argument("--format_cooldown_top1_max", type=float, default=None,
+                        help="pure_soft 格式 cooldown 仅在 raw top1 prob 不高于该值时触发；可与 entropy/margin gate 取 OR")
+    parser.add_argument("--format_cooldown_margin_max", type=float, default=None,
+                        help="pure_soft 格式 cooldown 仅在 raw top1-top2 margin 不高于该值时触发；可与 entropy/top1 gate 取 OR")
     parser.add_argument("--pure_soft_answer_zone_discrete", action="store_true",
                         help="pure_soft 中进入答案区后强制使用离散 token embedding")
+    parser.add_argument("--pure_soft_image_pad_bias", action="store_true",
+                        help="pure_soft 中将 <|image_pad|> embedding 以小权重混入 soft embedding")
+    parser.add_argument("--image_pad_bias_lambda", type=float, default=0.0,
+                        help="pure_soft image-pad bias 混合强度，例如 0.03/0.05/0.10")
+    parser.add_argument("--image_pad_bias_min_step", type=int, default=0,
+                        help="pure_soft image-pad bias 允许生效的最早生成步数")
+    parser.add_argument("--image_pad_bias_max_step", type=int, default=None,
+                        help="pure_soft image-pad bias 允许生效的最晚生成步数；默认全程")
+    parser.add_argument("--image_pad_bias_entropy_min", type=float, default=None,
+                        help="pure_soft image-pad bias 仅在 raw entropy 不低于该值时生效")
     parser.add_argument("--lead_soft_veto_on_diffuse", action="store_true",
                         help="LEAD 中当 soft 步满足低置信扩散和退化 gate 时，当前步改用离散 embedding")
     parser.add_argument("--lead_veto_entropy_window", type=int, default=16,
@@ -741,6 +771,7 @@ def main():
         "alpha": args.alpha,
         "max_switch_count": args.max_switch_count,
         "window_size": args.window_size,
+        "lead_disable_simple_visual_anchor": args.lead_disable_simple_visual_anchor,
         "cot_prompt_mode": args.cot_prompt_mode,
         "visual_anchor_top_m": args.visual_anchor_top_m,
         "visual_anchor_attn_last_k": args.visual_anchor_attn_last_k,
@@ -774,7 +805,21 @@ def main():
         "collapse_recent_repeat_tau": args.collapse_recent_repeat_tau,
         "pure_soft_format_cooldown": args.pure_soft_format_cooldown,
         "format_cooldown_steps": args.format_cooldown_steps,
+        "format_cooldown_min_step": args.format_cooldown_min_step,
+        "format_cooldown_highrisk_only": args.format_cooldown_highrisk_only,
+        "format_cooldown_normal_steps": args.format_cooldown_normal_steps,
+        "format_cooldown_highrisk_steps": args.format_cooldown_highrisk_steps,
+        "format_cooldown_mix_lambda": args.format_cooldown_mix_lambda,
+        "format_cooldown_max_active": args.format_cooldown_max_active,
+        "format_cooldown_entropy_min": args.format_cooldown_entropy_min,
+        "format_cooldown_top1_max": args.format_cooldown_top1_max,
+        "format_cooldown_margin_max": args.format_cooldown_margin_max,
         "pure_soft_answer_zone_discrete": args.pure_soft_answer_zone_discrete,
+        "pure_soft_image_pad_bias": args.pure_soft_image_pad_bias,
+        "image_pad_bias_lambda": args.image_pad_bias_lambda,
+        "image_pad_bias_min_step": args.image_pad_bias_min_step,
+        "image_pad_bias_max_step": args.image_pad_bias_max_step,
+        "image_pad_bias_entropy_min": args.image_pad_bias_entropy_min,
         "lead_soft_veto_on_diffuse": args.lead_soft_veto_on_diffuse,
         "lead_veto_entropy_window": args.lead_veto_entropy_window,
         "lead_veto_entropy_alpha": args.lead_veto_entropy_alpha,

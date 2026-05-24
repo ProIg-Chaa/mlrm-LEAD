@@ -135,6 +135,12 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
         gen_kwargs["sidecar_attn_on_entropy"] = True
         gen_kwargs["sidecar_attn_entropy_threshold"] = args.sidecar_attn_entropy_threshold
         gen_kwargs["sidecar_attn_last_k"] = args.sidecar_attn_last_k
+    if args.method == "pure_soft":
+        gen_kwargs["image_pad_bias"] = getattr(args, "pure_soft_image_pad_bias", False)
+        gen_kwargs["image_pad_bias_lambda"] = getattr(args, "image_pad_bias_lambda", 0.0)
+        gen_kwargs["image_pad_bias_min_step"] = getattr(args, "image_pad_bias_min_step", 0)
+        gen_kwargs["image_pad_bias_max_step"] = getattr(args, "image_pad_bias_max_step", None)
+        gen_kwargs["image_pad_bias_entropy_min"] = getattr(args, "image_pad_bias_entropy_min", None)
     if args.method == "cot_visual_reanchor":
         gen_kwargs["reanchor_entropy_threshold"] = args.reanchor_entropy_threshold
         gen_kwargs["reanchor_visual_attn_threshold"] = args.reanchor_visual_attn_threshold
@@ -162,6 +168,7 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["alpha_0"] = args.alpha
             model_inputs["max_switch_count"] = args.max_switch_count
             model_inputs["window_size"] = args.window_size
+            model_inputs["lead_disable_simple_visual_anchor"] = args.lead_disable_simple_visual_anchor
             model_inputs["convergence_words"] = "</think>"
             model_inputs["lead_soft_veto_on_diffuse"] = args.lead_soft_veto_on_diffuse
             model_inputs["lead_veto_entropy_window"] = args.lead_veto_entropy_window
@@ -227,6 +234,15 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["collapse_recent_repeat_tau"] = args.collapse_recent_repeat_tau
             model_inputs["format_cooldown"] = args.pure_soft_format_cooldown
             model_inputs["format_cooldown_steps"] = args.format_cooldown_steps
+            model_inputs["format_cooldown_min_step"] = args.format_cooldown_min_step
+            model_inputs["format_cooldown_highrisk_only"] = args.format_cooldown_highrisk_only
+            model_inputs["format_cooldown_normal_steps"] = args.format_cooldown_normal_steps
+            model_inputs["format_cooldown_highrisk_steps"] = args.format_cooldown_highrisk_steps
+            model_inputs["format_cooldown_mix_lambda"] = args.format_cooldown_mix_lambda
+            model_inputs["format_cooldown_max_active"] = args.format_cooldown_max_active
+            model_inputs["format_cooldown_entropy_min"] = args.format_cooldown_entropy_min
+            model_inputs["format_cooldown_top1_max"] = args.format_cooldown_top1_max
+            model_inputs["format_cooldown_margin_max"] = args.format_cooldown_margin_max
             model_inputs["answer_zone_discrete"] = args.pure_soft_answer_zone_discrete
             outputs = generate_pure_soft(
                 model,

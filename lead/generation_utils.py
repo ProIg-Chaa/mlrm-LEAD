@@ -115,6 +115,11 @@ _FORMAT_TOKEN_TEXTS = {
     "<", ">", "</", "<think", "think", "answer", "option", "**", "*",
 }
 
+_HIGH_RISK_FORMAT_TOKEN_TEXTS = {
+    ":", "(", ")", "[", "]", "{", "}", "<", ">", "</", "<think", "think",
+    "answer", "option", "**",
+}
+
 
 def _is_format_token_text(text):
     raw = text or ""
@@ -125,6 +130,19 @@ def _is_format_token_text(text):
     if raw in _FORMAT_TOKEN_TEXTS or stripped in _FORMAT_TOKEN_TEXTS or lowered in _FORMAT_TOKEN_TEXTS:
         return True
     if all((not ch.isalnum()) for ch in stripped):
+        return True
+    return False
+
+
+def _is_high_risk_format_token_text(text):
+    raw = text or ""
+    stripped = raw.strip()
+    lowered = stripped.lower().replace("▁", " ")
+    if not stripped:
+        return False
+    if raw in _HIGH_RISK_FORMAT_TOKEN_TEXTS or stripped in _HIGH_RISK_FORMAT_TOKEN_TEXTS or lowered in _HIGH_RISK_FORMAT_TOKEN_TEXTS:
+        return True
+    if "answer" in lowered or "think" in lowered or "option" in lowered:
         return True
     return False
 
@@ -387,6 +405,11 @@ def generate_pure_soft(model, tokenizer, **kwargs):
     """Generate with probability-weighted token embeddings at every decode step."""
     input_ids = kwargs.pop("input_ids")
     attention_mask = kwargs.pop("attention_mask")
+    image_pad_bias = kwargs.pop("image_pad_bias", False)
+    image_pad_bias_lambda = kwargs.pop("image_pad_bias_lambda", 0.0)
+    image_pad_bias_min_step = kwargs.pop("image_pad_bias_min_step", 0)
+    image_pad_bias_max_step = kwargs.pop("image_pad_bias_max_step", None)
+    image_pad_bias_entropy_min = kwargs.pop("image_pad_bias_entropy_min", None)
     vision_inputs = {}
     for key in list(kwargs.keys()):
         if any(tag in key for tag in ("pixel", "image", "video")):
@@ -420,6 +443,15 @@ def generate_pure_soft(model, tokenizer, **kwargs):
     collapse_recent_repeat_tau = kwargs.pop("collapse_recent_repeat_tau", 0.0)
     format_cooldown = kwargs.pop("format_cooldown", False)
     format_cooldown_steps = kwargs.pop("format_cooldown_steps", 0)
+    format_cooldown_min_step = kwargs.pop("format_cooldown_min_step", 0)
+    format_cooldown_highrisk_only = kwargs.pop("format_cooldown_highrisk_only", False)
+    format_cooldown_normal_steps = kwargs.pop("format_cooldown_normal_steps", None)
+    format_cooldown_highrisk_steps = kwargs.pop("format_cooldown_highrisk_steps", None)
+    format_cooldown_mix_lambda = kwargs.pop("format_cooldown_mix_lambda", 1.0)
+    format_cooldown_max_active = kwargs.pop("format_cooldown_max_active", 0)
+    format_cooldown_entropy_min = kwargs.pop("format_cooldown_entropy_min", None)
+    format_cooldown_top1_max = kwargs.pop("format_cooldown_top1_max", None)
+    format_cooldown_margin_max = kwargs.pop("format_cooldown_margin_max", None)
     answer_zone_discrete = kwargs.pop("answer_zone_discrete", False)
 
     if attention_mask is None:
@@ -427,6 +459,11 @@ def generate_pure_soft(model, tokenizer, **kwargs):
 
     batch_size, device = input_ids.shape[0], input_ids.device
     E = model.get_input_embeddings().weight
+    image_pad_emb = None
+    if image_pad_bias and float(image_pad_bias_lambda) > 0.0:
+        imgpad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if isinstance(imgpad_id, int) and imgpad_id >= 0:
+            image_pad_emb = E[imgpad_id]
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
     prompt_lens = [len(ids) for ids in all_generated]
     unfinished_idx = list(range(batch_size))
@@ -436,6 +473,7 @@ def generate_pure_soft(model, tokenizer, **kwargs):
     entropy_history = [[] for _ in range(batch_size)]
     collapse_candidate_history = [[] for _ in range(batch_size)]
     format_cooldowns = [0 for _ in range(batch_size)]
+    format_cooldown_active_counts = [0 for _ in range(batch_size)]
     answer_zone_active = [False for _ in range(batch_size)]
 
     for step in range(max_new_tokens):
@@ -499,6 +537,7 @@ def generate_pure_soft(model, tokenizer, **kwargs):
         collapse_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         format_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        image_pad_bias_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         answer_zone_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         answer_zone_trigger_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         entropy_delta = torch.zeros(cur_batch, dtype=raw_entropy.dtype, device=device)
@@ -559,16 +598,48 @@ def generate_pure_soft(model, tokenizer, **kwargs):
 
                 refined_mask[bi] = True
             collapse_mask = refined_mask
-        if format_cooldown and int(format_cooldown_steps) > 0:
+        if format_cooldown and int(format_cooldown_steps) > 0 and step >= int(format_cooldown_min_step):
             for bi, orig in enumerate(unfinished_idx):
                 token_text = tokenizer.decode(
                     [int(next_tokens[bi].item())],
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
-                is_format = _is_format_token_text(token_text)
+                is_highrisk = _is_high_risk_format_token_text(token_text)
+                is_format = is_highrisk if format_cooldown_highrisk_only else _is_format_token_text(token_text)
+                if is_format and (
+                    format_cooldown_entropy_min is not None
+                    or format_cooldown_top1_max is not None
+                    or format_cooldown_margin_max is not None
+                ):
+                    unstable = False
+                    if format_cooldown_entropy_min is not None:
+                        unstable = unstable or (
+                            float(raw_entropy[bi].item()) >= float(format_cooldown_entropy_min)
+                        )
+                    if format_cooldown_top1_max is not None:
+                        unstable = unstable or (
+                            float(raw_top1_prob[bi].item()) <= float(format_cooldown_top1_max)
+                        )
+                    if format_cooldown_margin_max is not None:
+                        unstable = unstable or (
+                            float(raw_margin[bi].item()) <= float(format_cooldown_margin_max)
+                        )
+                    is_format = unstable
                 format_token_mask[bi] = is_format
                 format_mask[bi] = is_format or format_cooldowns[orig] > 0
+                if int(format_cooldown_max_active) > 0 and format_cooldown_active_counts[orig] >= int(format_cooldown_max_active):
+                    format_mask[bi] = False
+        if image_pad_emb is not None:
+            image_pad_bias_mask = torch.ones(cur_batch, dtype=torch.bool, device=device)
+            if int(image_pad_bias_min_step) > 0:
+                image_pad_bias_mask = image_pad_bias_mask & (step >= int(image_pad_bias_min_step))
+            if image_pad_bias_max_step is not None:
+                image_pad_bias_mask = image_pad_bias_mask & (step <= int(image_pad_bias_max_step))
+            if image_pad_bias_entropy_min is not None:
+                image_pad_bias_mask = image_pad_bias_mask & (
+                    raw_entropy >= float(image_pad_bias_entropy_min)
+                )
         if answer_zone_discrete:
             for bi, orig in enumerate(unfinished_idx):
                 recent_ids = all_generated[orig][prompt_lens[orig]:] + [int(next_tokens[bi].item())]
@@ -581,8 +652,16 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                 answer_zone_trigger_mask[bi] = triggered
                 answer_zone_mask[bi] = answer_zone_active[orig] or triggered
 
-        route_mask = collapse_mask | format_mask | answer_zone_mask
-        last_emb = torch.where(route_mask[:, None], normal_emb, soft_emb)
+        format_lambda = max(0.0, min(1.0, float(format_cooldown_mix_lambda)))
+        biased_soft_emb = soft_emb
+        if image_pad_emb is not None:
+            bias_lambda = max(0.0, min(1.0, float(image_pad_bias_lambda)))
+            mixed_soft_emb = (1.0 - bias_lambda) * soft_emb + bias_lambda * image_pad_emb.to(soft_emb.device)
+            biased_soft_emb = torch.where(image_pad_bias_mask[:, None], mixed_soft_emb, soft_emb)
+        format_emb = format_lambda * normal_emb + (1.0 - format_lambda) * biased_soft_emb
+        last_emb = biased_soft_emb
+        last_emb = torch.where(format_mask[:, None], format_emb, last_emb)
+        last_emb = torch.where((collapse_mask | answer_zone_mask)[:, None], normal_emb, last_emb)
 
         for bi, orig in enumerate(unfinished_idx):
             token_id = next_tokens[bi].item()
@@ -605,6 +684,35 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                         "collapse_on_diffuse": bool(collapse_mask[bi].item()),
                         "format_cooldown_active": bool(format_mask[bi].item()),
                         "format_token": bool(format_token_mask[bi].item()),
+                        "format_cooldown_highrisk_only": bool(format_cooldown_highrisk_only),
+                        "format_cooldown_min_step": int(format_cooldown_min_step),
+                        "format_cooldown_normal_steps": (
+                            None if format_cooldown_normal_steps is None else int(format_cooldown_normal_steps)
+                        ),
+                        "format_cooldown_highrisk_steps": (
+                            None if format_cooldown_highrisk_steps is None else int(format_cooldown_highrisk_steps)
+                        ),
+                        "format_cooldown_mix_lambda": float(format_lambda),
+                        "format_cooldown_max_active": int(format_cooldown_max_active),
+                        "format_cooldown_entropy_min": (
+                            None if format_cooldown_entropy_min is None else float(format_cooldown_entropy_min)
+                        ),
+                        "format_cooldown_top1_max": (
+                            None if format_cooldown_top1_max is None else float(format_cooldown_top1_max)
+                        ),
+                        "format_cooldown_margin_max": (
+                            None if format_cooldown_margin_max is None else float(format_cooldown_margin_max)
+                        ),
+                        "image_pad_bias_active": bool(image_pad_bias_mask[bi].item()),
+                        "image_pad_bias_lambda": float(image_pad_bias_lambda),
+                        "image_pad_bias_min_step": int(image_pad_bias_min_step),
+                        "image_pad_bias_max_step": (
+                            None if image_pad_bias_max_step is None else int(image_pad_bias_max_step)
+                        ),
+                        "image_pad_bias_entropy_min": (
+                            None if image_pad_bias_entropy_min is None else float(image_pad_bias_entropy_min)
+                        ),
+                        "format_cooldown_active_count": int(format_cooldown_active_counts[orig]),
                         "format_cooldown_remaining": int(format_cooldowns[orig]),
                         "answer_zone_discrete_active": bool(answer_zone_mask[bi].item()),
                         "answer_zone_trigger": bool(answer_zone_trigger_mask[bi].item()),
@@ -634,10 +742,28 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                 )
             if format_cooldown and int(format_cooldown_steps) > 0:
                 orig = unfinished_idx[bi]
-                if bool(format_token_mask[bi].item()):
-                    format_cooldowns[orig] = max(0, int(format_cooldown_steps) - 1)
+                if step < int(format_cooldown_min_step):
+                    format_cooldowns[orig] = 0
+                elif int(format_cooldown_max_active) > 0 and format_cooldown_active_counts[orig] >= int(format_cooldown_max_active):
+                    format_cooldowns[orig] = 0
+                elif bool(format_token_mask[bi].item()):
+                    token_text = tokenizer.decode(
+                        [int(next_tokens[bi].item())],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    is_highrisk = _is_high_risk_format_token_text(token_text)
+                    if is_highrisk and format_cooldown_highrisk_steps is not None:
+                        steps = int(format_cooldown_highrisk_steps)
+                    elif (not is_highrisk) and format_cooldown_normal_steps is not None:
+                        steps = int(format_cooldown_normal_steps)
+                    else:
+                        steps = int(format_cooldown_steps)
+                    format_cooldowns[orig] = max(0, steps - 1)
                 elif format_cooldowns[orig] > 0:
                     format_cooldowns[orig] -= 1
+                if bool(format_mask[bi].item()):
+                    format_cooldown_active_counts[orig] += 1
             if answer_zone_discrete and bool(answer_zone_trigger_mask[bi].item()):
                 answer_zone_active[unfinished_idx[bi]] = True
 
@@ -1010,6 +1136,7 @@ def generate_lead(model, tokenizer, **kwargs):
     lead_veto_repeat_ngram = kwargs.pop("lead_veto_repeat_ngram", 3)
     lead_veto_recent_repeat_window = kwargs.pop("lead_veto_recent_repeat_window", 32)
     lead_veto_recent_repeat_tau = kwargs.pop("lead_veto_recent_repeat_tau", 0.35)
+    lead_disable_simple_visual_anchor = kwargs.pop("lead_disable_simple_visual_anchor", False)
 
     # ============================================
 
@@ -1038,10 +1165,10 @@ def generate_lead(model, tokenizer, **kwargs):
     if end_thinking_token_id is None:
         end_thinking_token_id = _resolve_token_id("</think>")
 
-    #===把<think>替换成<|image_pad|>=======
-    imgpad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
-    thinking_token_id = imgpad_id
-    #=====================================
+    if not lead_disable_simple_visual_anchor:
+        # 原始 LEAD：把 <think> anchor 替换成 <|image_pad|> embedding。
+        imgpad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        thinking_token_id = imgpad_id
 
     start_thinking_emb, end_thinking_emb = E[thinking_token_id], E[end_thinking_token_id]
     newline_id = _resolve_token_id("\\n", "\n")

@@ -294,7 +294,310 @@ last_emb = torch.where(anchor_mask[:, None], anchor_emb, last_emb)
 
 这样跑完后可以统计“到底触发了多少次、集中在哪些样本、是否修复/损坏”。
 
-## 7. 常用脚本说明
+## 7. 完整例子：新增一个更严格的 answer-zone 路由
+
+这个例子演示从“想法”到“代码开关”再到“脚本启动”的完整过程。
+
+### 7.1 实验想法
+
+现有 `answer_zone_discrete` 的信号是：
+
+- 最近 16 个生成 token 中出现 `</think`
+- 或者出现 `answer`
+
+问题是：模型可能在思考区里写出 “the answer should be ...”，这会提前触发 answer-zone，导致过早离散化。
+
+所以可以做一个更严格的新实验：
+
+- 新信号：只在检测到 `</think>` 后触发
+- 新动作：触发后，后续 token 全部用离散 embedding
+- 实验名：`answer_zone_think_end_only`
+
+这个实验和原 `answer_zone_discrete` 的区别只有信号不同，动作相同。
+
+### 7.2 第一步：在 `main.py` 增加参数
+
+位置：`main.py` 约 499 行附近，已有：
+
+```python
+parser.add_argument("--pure_soft_answer_zone_discrete", action="store_true",
+                    help="pure_soft 中进入答案区后强制使用离散 token embedding")
+```
+
+在它后面加：
+
+```python
+parser.add_argument("--pure_soft_answer_zone_think_end_only", action="store_true",
+                    help="pure_soft 中只在检测到 </think> 后进入答案区并强制离散 token embedding")
+```
+
+如果 `main.py` 后面有 config 记录字典，也要把它加进去：
+
+```python
+"pure_soft_answer_zone_think_end_only": args.pure_soft_answer_zone_think_end_only,
+```
+
+### 7.3 第二步：在 `lead/inference.py` 传参数
+
+位置：`lead/inference.py` 约 228-230 行，已有：
+
+```python
+model_inputs["format_cooldown"] = args.pure_soft_format_cooldown
+model_inputs["format_cooldown_steps"] = args.format_cooldown_steps
+model_inputs["answer_zone_discrete"] = args.pure_soft_answer_zone_discrete
+```
+
+在后面加：
+
+```python
+model_inputs["answer_zone_think_end_only"] = args.pure_soft_answer_zone_think_end_only
+```
+
+### 7.4 第三步：在 `generate_pure_soft` 读取参数
+
+位置：`lead/generation_utils.py` 的 `generate_pure_soft(...)` 开头，已有：
+
+```python
+format_cooldown = kwargs.pop("format_cooldown", False)
+format_cooldown_steps = kwargs.pop("format_cooldown_steps", 0)
+answer_zone_discrete = kwargs.pop("answer_zone_discrete", False)
+```
+
+改成：
+
+```python
+format_cooldown = kwargs.pop("format_cooldown", False)
+format_cooldown_steps = kwargs.pop("format_cooldown_steps", 0)
+answer_zone_discrete = kwargs.pop("answer_zone_discrete", False)
+answer_zone_think_end_only = kwargs.pop("answer_zone_think_end_only", False)
+```
+
+### 7.5 第四步：修改信号判断
+
+位置：`lead/generation_utils.py` 的 `answer_zone_discrete` 判断块，当前类似：
+
+```python
+if answer_zone_discrete:
+    for bi, orig in enumerate(unfinished_idx):
+        recent_ids = all_generated[orig][prompt_lens[orig]:] + [int(next_tokens[bi].item())]
+        recent_text = tokenizer.decode(
+            recent_ids[-16:],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ).lower()
+        triggered = ("</think" in recent_text) or ("answer" in recent_text)
+        answer_zone_trigger_mask[bi] = triggered
+        answer_zone_mask[bi] = answer_zone_active[orig] or triggered
+```
+
+改成：
+
+```python
+if answer_zone_discrete or answer_zone_think_end_only:
+    for bi, orig in enumerate(unfinished_idx):
+        recent_ids = all_generated[orig][prompt_lens[orig]:] + [int(next_tokens[bi].item())]
+        recent_text = tokenizer.decode(
+            recent_ids[-16:],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ).lower()
+        if answer_zone_think_end_only:
+            triggered = "</think" in recent_text
+        else:
+            triggered = ("</think" in recent_text) or ("answer" in recent_text)
+        answer_zone_trigger_mask[bi] = triggered
+        answer_zone_mask[bi] = answer_zone_active[orig] or triggered
+```
+
+动作不需要改，因为动作统一在这里：
+
+```python
+route_mask = collapse_mask | format_mask | answer_zone_mask
+last_emb = torch.where(route_mask[:, None], normal_emb, soft_emb)
+```
+
+### 7.6 第五步：trace 里记录新信号
+
+在 token trace 的 record 里，已有：
+
+```python
+"answer_zone_discrete_active": bool(answer_zone_mask[bi].item()),
+"answer_zone_trigger": bool(answer_zone_trigger_mask[bi].item()),
+```
+
+建议补一项，便于后面区分不同 answer-zone 实验：
+
+```python
+"answer_zone_think_end_only": bool(answer_zone_think_end_only),
+```
+
+如果想让 `mode` 更直观，也可以把：
+
+```python
+"mode": (
+    "collapsed"
+    if bool(collapse_mask[bi].item())
+    else ("format_cooldown" if bool(format_mask[bi].item()) else "pure_soft")
+),
+```
+
+改成：
+
+```python
+"mode": (
+    "collapsed"
+    if bool(collapse_mask[bi].item())
+    else (
+        "format_cooldown"
+        if bool(format_mask[bi].item())
+        else ("answer_zone_discrete" if bool(answer_zone_mask[bi].item()) else "pure_soft")
+    )
+),
+```
+
+这一步不影响模型输出，只影响日志可读性。
+
+### 7.7 第六步：复制脚本
+
+复制现有 answer-zone 脚本：
+
+```bash
+cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
+cp script/exp5_16/run_pure_soft_answer_zone_discrete_vstar_full.sh \
+   script/exp5_16/run_pure_soft_answer_zone_think_end_only_vstar_full.sh
+chmod +x script/exp5_16/run_pure_soft_answer_zone_think_end_only_vstar_full.sh
+```
+
+然后编辑新脚本：
+
+```bash
+vim script/exp5_16/run_pure_soft_answer_zone_think_end_only_vstar_full.sh
+```
+
+需要改三类地方。
+
+第一，改实验目录名：
+
+```bash
+BASE_DIR="${ROOT}/output/experiments/${STAMP}/pure_soft_answer_zone_think_end_only_vstar_full"
+RUN_DIR="${BASE_DIR}/answer_zone_think_end_only_gpu1"
+```
+
+第二，把启动参数从：
+
+```bash
+--pure_soft_answer_zone_discrete
+```
+
+改成：
+
+```bash
+--pure_soft_answer_zone_think_end_only
+```
+
+第三，把 compare 里的 run 名从 `answer_zone_discrete` 改成 `answer_zone_think_end_only`。例如：
+
+```python
+runs = {
+    "baseline": Path("${BASELINE_RUN}"),
+    "answer_zone_think_end_only": Path("${RUN_DIR}"),
+}
+```
+
+trace 统计可以继续统计：
+
+```python
+count = sum(1 for t in (r.get("tokens") or []) if t.get("answer_zone_discrete_active"))
+```
+
+因为底层字段仍表示“answer-zone 动作是否激活”。如果已经新增了专门字段，也可以改成统计新字段。
+
+### 7.8 第七步：先做语法检查
+
+改完代码后先跑：
+
+```bash
+cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
+/share/home/wangzixu/.local/share/mamba/envs/mlrm-lead/bin/python -m py_compile \
+  main.py lead/inference.py lead/generation_utils.py
+```
+
+通过后再启动实验。
+
+### 7.9 第八步：启动实验
+
+```bash
+cd /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD
+bash script/exp5_16/run_pure_soft_answer_zone_think_end_only_vstar_full.sh
+```
+
+脚本会输出类似：
+
+```text
+BASE_DIR=/share/home/.../output/experiments/20260520_xxxxxx/pure_soft_answer_zone_think_end_only_vstar_full
+RUN_DIR=/share/home/.../answer_zone_think_end_only_gpu1
+PID=xxxxxx
+Compare after done:
+  bash /share/home/.../compare_after_done.sh
+```
+
+### 7.10 第九步：检查是否正常
+
+把脚本输出的 `RUN_DIR` 复制出来：
+
+```bash
+RUN=/share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD/output/experiments/20260520_xxxxxx/pure_soft_answer_zone_think_end_only_vstar_full/answer_zone_think_end_only_gpu1
+ps -p $(cat "$RUN/pid.txt") -o pid,stat,etime,cmd
+tail -50 "$RUN/nohup.log"
+nvidia-smi
+```
+
+判断正常的标准：
+
+- `ps` 能看到进程还在。
+- `nohup.log` 里能看到模型加载完成，并出现 `[1/191]`、`[2/191]` 这样的样本进度。
+- `nvidia-smi` 里对应 GPU 有显存占用和利用率。
+
+### 7.11 第十步：跑完后比较
+
+```bash
+bash /share/home/wangzixu/liudinghao/gushuo/proj/mlrm-LEAD/output/experiments/20260520_xxxxxx/pure_soft_answer_zone_think_end_only_vstar_full/compare_after_done.sh
+```
+
+重点看这些行：
+
+- `accuracy`
+- `length mean / p90 / max`
+- `long>=256`
+- `maxed1024`
+- `delta_vs_baseline: changed / fixed / damaged / net`
+- answer-zone 触发次数
+
+判断这个实验是否有价值：
+
+- 如果准确率上升，同时 `damaged` 很少，说明信号更精确。
+- 如果准确率没变但 `long>=256`、`maxed1024` 明显下降，说明它可能是一个格式稳定路由。
+- 如果 `changed` 很多、`damaged` 也很多，说明动作过强或者信号触发太早。
+- 如果几乎不触发，说明信号太窄，需要扩大到 `</think>` 后的答案模板，或者加入 `Answer:` 但排除思考区普通 answer。
+
+### 7.12 这个例子对应的“切换路由”逻辑
+
+在这个例子里：
+
+- 路由动作没有变：仍然是 `normal_emb` 替代 `soft_emb`
+- 变的是路由信号：
+  - 旧信号：`</think` 或 `answer`
+  - 新信号：只看 `</think`
+
+如果要换动作，比如不是离散化，而是加入视觉 anchor，那么改动点不是 `triggered = ...`，而是：
+
+```python
+last_emb = torch.where(route_mask[:, None], normal_emb, soft_emb)
+```
+
+需要改成多分支 embedding 选择。
+
+## 8. 常用脚本说明
 
 近期 VStar 路由实验：
 
@@ -317,7 +620,7 @@ last_emb = torch.where(anchor_mask[:, None], anchor_emb, last_emb)
 - `run_lead_soft_veto_late64_repeat_gate_vstar_full.sh`
   - 在 LEAD 上尝试 soft veto
 
-## 8. 结果文件怎么看
+## 9. 结果文件怎么看
 
 每个 run 目录通常有：
 
@@ -347,7 +650,7 @@ bash <base_dir>/compare_after_done.sh
 
 如果 `wc -l results.jsonl` 等于 `191`，VStar full 基本跑完。
 
-## 9. 当前最重要的已有结果
+## 10. 当前最重要的已有结果
 
 - pure-soft baseline：`112/191 = 58.64%`
 - LEAD baseline：`139/191 = 72.77%`
@@ -364,7 +667,7 @@ bash <base_dir>/compare_after_done.sh
 3. `cooldown2 + late64_repeat_gate` 是否能在不损坏正确样本的情况下继续补救长输出/退化样本。
 4. `answer_zone_discrete` 是否能用更精确 answer-zone 信号替代宽泛 format cooldown。
 
-## 10. 新开一个实验的推荐模板
+## 11. 新开一个实验的推荐模板
 
 不要直接手写长命令，建议复制最近的脚本：
 
@@ -391,7 +694,7 @@ tail -50 output/experiments/<时间戳>/<实验名>/<run_name>/nohup.log
 nvidia-smi
 ```
 
-## 11. 当前正在跑的实验
+## 12. 当前正在跑的实验
 
 截至 2026-05-20 11:42 左右：
 
@@ -411,4 +714,3 @@ tail -50 output/experiments/20260520_113540/pure_soft_cooldown2_late64_repeat_ga
 ps -p $(cat output/experiments/20260520_114012/pure_soft_answer_zone_discrete_vstar_full/answer_zone_discrete_gpu1/pid.txt) -o pid,stat,etime,cmd
 tail -50 output/experiments/20260520_114012/pure_soft_answer_zone_discrete_vstar_full/answer_zone_discrete_gpu1/nohup.log
 ```
-
