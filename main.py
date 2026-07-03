@@ -430,6 +430,20 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 离散到潜在模式切换的最小持续步数")
     parser.add_argument("--lead_disable_simple_visual_anchor", action="store_true",
                         help="LEAD 消融：不把 <think> anchor 替换为 <|image_pad|> embedding")
+    parser.add_argument("--lead_force_normal", action="store_true",
+                        help="LEAD sanity 消融：保留 LEAD 生成代码路径，但全程使用离散 normal embedding")
+    parser.add_argument("--lead_initial_soft_only", action="store_true",
+                        help="LEAD 消融：仅第 0 个生成 token 的下一步输入使用 soft embedding，之后全程 normal")
+    parser.add_argument("--lead_initial_transition_only", action="store_true",
+                        help="LEAD 消融：只保留开头 step0 soft 和首次 soft->normal 的 </think> 过渡混合，之后全程 normal")
+    parser.add_argument("--lead_initial_transition_delay_steps", type=int, default=0,
+                        help="LEAD timing 消融：把 initial_transition_only 延迟到第 N 个生成 step；0 等价当前开头 transition")
+    parser.add_argument("--lead_disable_step0_linebreak_mix", action="store_true",
+                        help="LEAD 消融：关闭 step0 soft_emb = 0.9*soft + 0.1*newline 的弱换行混合")
+    parser.add_argument("--lead_disable_to_normal_transition", action="store_true",
+                        help="LEAD 消融：关闭 soft->normal 时 normal_emb 与 </think> embedding 的过渡混合")
+    parser.add_argument("--lead_soft_quota_ratio", type=float, default=0.0,
+                        help="LEAD 实验：强制每个样本至少约该比例 token 使用 soft embedding，例如 0.05/0.10/0.20；0 表示关闭")
     parser.add_argument("--cot_prompt_mode", type=str, default="orign",
                         choices=["orign", "step"],
                         help="cot/cot_greedy 的 prompt 口径：orign 对齐原项目不追加 CoT 指令；step 追加 step-by-step 指令")
@@ -552,6 +566,8 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD soft veto 最近 token 重复率窗口")
     parser.add_argument("--lead_veto_recent_repeat_tau", type=float, default=0.35,
                         help="LEAD soft veto 最近 token 重复率阈值")
+    parser.add_argument("--lead_format_cooldown", action="store_true",
+                        help="LEAD 中命中格式 token 后，若干步强制使用离散 token embedding")
     parser.add_argument("--reanchor_entropy_threshold", type=float, default=1.0,
                         help="cot_visual_reanchor 中触发视觉增强的 raw entropy 下限")
     parser.add_argument("--reanchor_visual_attn_threshold", type=float, default=0.12,
@@ -772,6 +788,13 @@ def main():
         "max_switch_count": args.max_switch_count,
         "window_size": args.window_size,
         "lead_disable_simple_visual_anchor": args.lead_disable_simple_visual_anchor,
+        "lead_force_normal": args.lead_force_normal,
+        "lead_initial_soft_only": args.lead_initial_soft_only,
+        "lead_initial_transition_only": args.lead_initial_transition_only,
+        "lead_initial_transition_delay_steps": args.lead_initial_transition_delay_steps,
+        "lead_disable_step0_linebreak_mix": args.lead_disable_step0_linebreak_mix,
+        "lead_disable_to_normal_transition": args.lead_disable_to_normal_transition,
+        "lead_soft_quota_ratio": args.lead_soft_quota_ratio,
         "cot_prompt_mode": args.cot_prompt_mode,
         "visual_anchor_top_m": args.visual_anchor_top_m,
         "visual_anchor_attn_last_k": args.visual_anchor_attn_last_k,
@@ -832,6 +855,7 @@ def main():
         "lead_veto_repeat_ngram": args.lead_veto_repeat_ngram,
         "lead_veto_recent_repeat_window": args.lead_veto_recent_repeat_window,
         "lead_veto_recent_repeat_tau": args.lead_veto_recent_repeat_tau,
+        "lead_format_cooldown": args.lead_format_cooldown,
         "reanchor_entropy_threshold": args.reanchor_entropy_threshold,
         "reanchor_visual_attn_threshold": args.reanchor_visual_attn_threshold,
         "reanchor_lambda": args.reanchor_lambda,
@@ -850,6 +874,7 @@ def main():
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "do_sample": args.do_sample,
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
         "dataset": dataset_path,

@@ -1,0 +1,492 @@
+[
+  {
+    "title": "VStar: COT wrong -> initial_transition fixed",
+    "phase": "phase1_vstar_mechanism",
+    "dataset": "vstar",
+    "ref_run": "cot_orign_greedy",
+    "cur_run": "initial_transition_only",
+    "mode": "fixed",
+    "selected_count": 18,
+    "median_first_divergence": 22.0,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 5,
+      "5-8": 1,
+      "9-16": 2,
+      "17-32": 2,
+      ">32": 8,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 129,
+        "question": "Is the cyclist on the left or right side of the woman's handbag?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 161,
+        "question": "Is the small red car on the left or right side of the baby carriage?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 3
+      },
+      {
+        "id": 164,
+        "question": "Is the yellow car on the left or right side of the pool?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 3
+      },
+      {
+        "id": 167,
+        "question": "Is the wheelchair on the left or right side of the lamp post?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 168,
+        "question": "Is the dog on the left or right side of the blue bicycle?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 12,
+        "question": "What is the color of the slippers?",
+        "gold": "C",
+        "ref_pred": null,
+        "cur_pred": "C",
+        "first_divergence": 6
+      }
+    ]
+  },
+  {
+    "title": "VStar: initial_transition correct -> no_to_normal damaged",
+    "phase": "phase1_vstar_mechanism",
+    "dataset": "vstar",
+    "ref_run": "initial_transition_only",
+    "cur_run": "initial_transition_no_to_normal",
+    "mode": "damaged",
+    "selected_count": 13,
+    "median_first_divergence": 23,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 3,
+      "5-8": 1,
+      "9-16": 0,
+      "17-32": 4,
+      ">32": 5,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 135,
+        "question": "Is the person with white trousers on the left or right side of the person in blue?",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 3
+      },
+      {
+        "id": 140,
+        "question": "Is the bucket on the left or right side of the plunger?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 168,
+        "question": "Is the dog on the left or right side of the blue bicycle?",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 3
+      },
+      {
+        "id": 12,
+        "question": "What is the color of the slippers?",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": 6
+      },
+      {
+        "id": 116,
+        "question": "Is the red car on the left or right side of the police car?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 18
+      },
+      {
+        "id": 57,
+        "question": "What is the color of the bicycle?",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": 19
+      }
+    ]
+  },
+  {
+    "title": "MMVP: COT wrong -> initial_transition fixed",
+    "phase": "phase3_cross_dataset_minimal",
+    "dataset": "mmvp",
+    "ref_run": "cot_orign_greedy",
+    "cur_run": "initial_transition_only",
+    "mode": "fixed",
+    "selected_count": 12,
+    "median_first_divergence": 16.0,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 0,
+      "5-8": 2,
+      "9-16": 4,
+      "17-32": 5,
+      ">32": 1,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 241,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Is the photo taken directly above the coffee or from the side?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 7
+      },
+      {
+        "id": 293,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Is the sports car in the picture facing left or right?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 8
+      },
+      {
+        "id": 224,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Are all the cups and bottles in the picture the same height?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 11
+      },
+      {
+        "id": 60,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Can you see letter \"J\" in the image?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 12
+      },
+      {
+        "id": 92,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Is there any accessory on the wrists?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 14
+      },
+      {
+        "id": 212,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Does the snowman have arms made of branches?",
+        "gold": "A",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 14
+      }
+    ]
+  },
+  {
+    "title": "MMVP: initial_transition correct -> no_to_normal damaged",
+    "phase": "phase3_cross_dataset_minimal",
+    "dataset": "mmvp",
+    "ref_run": "initial_transition_only",
+    "cur_run": "initial_transition_no_to_normal",
+    "mode": "damaged",
+    "selected_count": 11,
+    "median_first_divergence": 19,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 0,
+      "5-8": 1,
+      "9-16": 3,
+      "17-32": 4,
+      ">32": 3,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 293,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Is the sports car in the picture facing left or right?",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 8
+      },
+      {
+        "id": 224,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Are all the cups and bottles in the picture the same height?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 11
+      },
+      {
+        "id": 179,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: How many wheels can you see in the image?",
+        "gold": "B",
+        "ref_pred": "A",
+        "cur_pred": "A",
+        "first_divergence": 12
+      },
+      {
+        "id": 215,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Are there black stripes on the roof of the car?",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": null,
+        "first_divergence": 13
+      },
+      {
+        "id": 116,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: How many eyes of the cat can you see in the picture?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "A",
+        "first_divergence": 18
+      },
+      {
+        "id": 208,
+        "question": "Solve the problem with proper reasoning, and make sure to put the FINAL CHOICE inside \\boxed{}. \\n Question: Is there an orange with leaves next to the cup?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 19
+      }
+    ]
+  },
+  {
+    "title": "VisuLogic: COT wrong -> initial_transition fixed",
+    "phase": "phase3_cross_dataset_minimal",
+    "dataset": "visulogic300",
+    "ref_run": "cot_orign_greedy",
+    "cur_run": "initial_transition_only",
+    "mode": "fixed",
+    "selected_count": 41,
+    "median_first_divergence": null,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 0,
+      "5-8": 0,
+      "9-16": 0,
+      "17-32": 0,
+      ">32": 0,
+      "no_full_trace_or_identical": 41
+    },
+    "case_details": [
+      {
+        "id": 1,
+        "question": "From the four given options, choose the most suitable one to fill in the question mark, so that it presents a certain regularity:",
+        "gold": "D",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": null
+      },
+      {
+        "id": 5,
+        "question": "The three-dimensional shape on the left has only one face colored black as shown in the figure. Which of the following options cannot be formed by three of the three-dimensional shapes on the left? (    ).",
+        "gold": "D",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": null
+      },
+      {
+        "id": 12,
+        "question": "From the four given options, choose the most suitable one to fill in the question mark, so that a certain pattern is presented:",
+        "gold": "C",
+        "ref_pred": "D",
+        "cur_pred": "C",
+        "first_divergence": null
+      },
+      {
+        "id": 23,
+        "question": "From the four given options, choose the most appropriate one to fill in the question mark, so that it presents a certain regularity.",
+        "gold": "C",
+        "ref_pred": "D",
+        "cur_pred": "C",
+        "first_divergence": null
+      },
+      {
+        "id": 27,
+        "question": "The diagram on the left shows the net of a cube's outer surface. Please identify the one incorrect option from the following.",
+        "gold": "D",
+        "ref_pred": "A",
+        "cur_pred": "D",
+        "first_divergence": null
+      },
+      {
+        "id": 58,
+        "question": "From the four given options, choose the most suitable one to fill in the question mark, so that it presents a certain pattern:",
+        "gold": "D",
+        "ref_pred": "A",
+        "cur_pred": "D",
+        "first_divergence": null
+      }
+    ]
+  },
+  {
+    "title": "VStar timing: step0 correct -> step16 damaged",
+    "phase": "phase2_timing_curve",
+    "dataset": "vstar",
+    "ref_run": "transition_step0",
+    "cur_run": "transition_step16",
+    "mode": "damaged",
+    "selected_count": 18,
+    "median_first_divergence": 19.0,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 3,
+      "5-8": 1,
+      "9-16": 2,
+      "17-32": 5,
+      ">32": 7,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 161,
+        "question": "Is the small red car on the left or right side of the baby carriage?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 164,
+        "question": "Is the yellow car on the left or right side of the pool?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 3
+      },
+      {
+        "id": 167,
+        "question": "Is the wheelchair on the left or right side of the lamp post?",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": "A",
+        "first_divergence": 3
+      },
+      {
+        "id": 12,
+        "question": "What is the color of the slippers?",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": null,
+        "first_divergence": 6
+      },
+      {
+        "id": 14,
+        "question": "What is the cartoon character on the clock.",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": null,
+        "first_divergence": 12
+      },
+      {
+        "id": 160,
+        "question": "Is the blue luggage on the left or right side of the bus?",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "B",
+        "first_divergence": 13
+      }
+    ]
+  },
+  {
+    "title": "VisuLogic timing: step0 correct -> step16 damaged",
+    "phase": "phase2_timing_curve_cross",
+    "dataset": "visulogic300",
+    "ref_run": "transition_step0",
+    "cur_run": "transition_step16",
+    "mode": "damaged",
+    "selected_count": 44,
+    "median_first_divergence": 38.5,
+    "bucket": {
+      "0": 0,
+      "1-2": 0,
+      "3-4": 0,
+      "5-8": 0,
+      "9-16": 6,
+      "17-32": 14,
+      ">32": 24,
+      "no_full_trace_or_identical": 0
+    },
+    "case_details": [
+      {
+        "id": 169,
+        "question": "From the four given options, choose the most suitable one to fill in the question mark so that a certain pattern is established:",
+        "gold": "B",
+        "ref_pred": "B",
+        "cur_pred": "C",
+        "first_divergence": 13
+      },
+      {
+        "id": 62,
+        "question": "From the four given options, choose the most suitable one to fill in the question mark so that it presents a certain pattern:",
+        "gold": "D",
+        "ref_pred": "D",
+        "cur_pred": "A",
+        "first_divergence": 14
+      },
+      {
+        "id": 184,
+        "question": "Select the most appropriate option from the four given choices to fill in the question mark, so that a certain pattern is exhibited:",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": 14
+      },
+      {
+        "id": 23,
+        "question": "From the four given options, choose the most appropriate one to fill in the question mark, so that it presents a certain regularity.",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": "D",
+        "first_divergence": 16
+      },
+      {
+        "id": 83,
+        "question": "Select the most appropriate option from the four given choices to fill in the question mark, so that a certain pattern is formed:",
+        "gold": "A",
+        "ref_pred": "A",
+        "cur_pred": "D",
+        "first_divergence": 16
+      },
+      {
+        "id": 110,
+        "question": "Select the most suitable option from the four given choices to fill in the question mark, so that a certain regularity is presented:",
+        "gold": "C",
+        "ref_pred": "C",
+        "cur_pred": "A",
+        "first_divergence": 16
+      }
+    ]
+  }
+]

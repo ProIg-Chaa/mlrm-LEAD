@@ -197,6 +197,9 @@ def generate_cot(model, tokenizer, **kwargs):
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
     trace_topk = kwargs.pop("trace_topk", 0)
+    forced_prefix_ids = kwargs.pop("forced_prefix_ids", None)
+    if forced_prefix_ids is not None:
+        forced_prefix_ids = [int(x) for x in forced_prefix_ids]
     log_visual_attn_summary = kwargs.pop("log_visual_attn_summary", False)
     visual_attn_summary_last_k = kwargs.pop("visual_attn_summary_last_k", 4)
     sidecar_attn_on_entropy = kwargs.pop("sidecar_attn_on_entropy", False)
@@ -286,7 +289,14 @@ def generate_cot(model, tokenizer, **kwargs):
             filtered_entropy = -(
                 probs * probs.clamp(min=1e-8).log()
             ).sum(dim=-1)
-            if do_sample:
+            if forced_prefix_ids is not None and step < len(forced_prefix_ids):
+                next_tokens = torch.full(
+                    (cur_batch,),
+                    int(forced_prefix_ids[step]),
+                    dtype=torch.long,
+                    device=device,
+                )
+            elif do_sample:
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
             else:
                 next_tokens = torch.argmax(probs, dim=-1)
@@ -534,9 +544,13 @@ def generate_pure_soft(model, tokenizer, **kwargs):
             if raw_top2.shape[-1] > 1
             else raw_top2[:, 0]
         )
+        spike_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        diffuse_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        repeat_degen_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         collapse_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         format_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        highrisk_format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         image_pad_bias_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         answer_zone_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         answer_zone_trigger_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
@@ -593,6 +607,7 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                     duplicate_ratio = 1.0 - (len(set(recent)) / max(1, len(recent)))
                     repeat_degen = repeat_degen or (duplicate_ratio >= repeat_tau)
 
+                repeat_degen_mask[bi] = repeat_degen
                 if collapse_require_repeat_degen and not repeat_degen:
                     continue
 
@@ -607,6 +622,7 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                 )
                 is_highrisk = _is_high_risk_format_token_text(token_text)
                 is_format = is_highrisk if format_cooldown_highrisk_only else _is_format_token_text(token_text)
+                highrisk_format_token_mask[bi] = is_highrisk
                 if is_format and (
                     format_cooldown_entropy_min is not None
                     or format_cooldown_top1_max is not None
@@ -667,6 +683,52 @@ def generate_pure_soft(model, tokenizer, **kwargs):
             token_id = next_tokens[bi].item()
             all_generated[orig].append(token_id)
             if token_trace is not None:
+                phase = (
+                    "early"
+                    if step <= 128
+                    else "mid" if step <= 512 else "late"
+                )
+                image_candidate = bool(image_pad_bias_mask[bi].item())
+                answer_active = bool(answer_zone_mask[bi].item())
+                collapse_active = bool(collapse_mask[bi].item())
+                format_active = bool(format_mask[bi].item())
+                if answer_active:
+                    route_signal = "answer_zone"
+                    route_action = "hard_discrete"
+                    route_priority = 100
+                elif collapse_active:
+                    route_signal = (
+                        "diffuse_repeat_degen"
+                        if bool(repeat_degen_mask[bi].item())
+                        else "diffuse_low_conf_spike"
+                    )
+                    route_action = "hard_discrete"
+                    route_priority = 90
+                elif format_active:
+                    route_signal = (
+                        "highrisk_format_uncertain"
+                        if bool(highrisk_format_token_mask[bi].item())
+                        else "format_uncertain"
+                    )
+                    route_action = "format_cooldown"
+                    route_priority = 80
+                elif image_candidate:
+                    route_signal = f"{phase}_visual_bias"
+                    route_action = "image_pad_bias"
+                    route_priority = 50
+                else:
+                    route_signal = "default"
+                    route_action = "pure_soft"
+                    route_priority = 0
+
+                suppressed = []
+                if image_candidate and answer_active:
+                    suppressed.append("image_pad_bias_by_answer_zone")
+                if image_candidate and collapse_active:
+                    suppressed.append("image_pad_bias_by_collapse")
+                if image_candidate and format_active:
+                    suppressed.append("image_pad_bias_by_format")
+
                 record = {
                     "step": int(step),
                     "batch_index": int(orig),
@@ -681,9 +743,15 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                         if bool(collapse_mask[bi].item())
                         else ("format_cooldown" if bool(format_mask[bi].item()) else "pure_soft")
                     ),
+                        "generation_phase": phase,
+                        "route_signal": route_signal,
+                        "route_action": route_action,
+                        "route_priority": int(route_priority),
+                        "route_suppressed_by": suppressed,
                         "collapse_on_diffuse": bool(collapse_mask[bi].item()),
                         "format_cooldown_active": bool(format_mask[bi].item()),
                         "format_token": bool(format_token_mask[bi].item()),
+                        "is_highrisk_format_token": bool(highrisk_format_token_mask[bi].item()),
                         "format_cooldown_highrisk_only": bool(format_cooldown_highrisk_only),
                         "format_cooldown_min_step": int(format_cooldown_min_step),
                         "format_cooldown_normal_steps": (
@@ -704,6 +772,13 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                             None if format_cooldown_margin_max is None else float(format_cooldown_margin_max)
                         ),
                         "image_pad_bias_active": bool(image_pad_bias_mask[bi].item()),
+                        "visual_bias_candidate": bool(image_candidate),
+                        "visual_bias_effective": (
+                            bool(image_candidate)
+                            and not bool(answer_active)
+                            and not bool(collapse_active)
+                            and not bool(format_active)
+                        ),
                         "image_pad_bias_lambda": float(image_pad_bias_lambda),
                         "image_pad_bias_min_step": int(image_pad_bias_min_step),
                         "image_pad_bias_max_step": (
@@ -720,6 +795,9 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                     "collapse_entropy_history_count": int(entropy_history_count[bi].item()),
                     "raw_top1_prob": float(raw_top1_prob[bi].item()),
                     "raw_margin": float(raw_margin[bi].item()),
+                    "entropy_spike_mask": bool(spike_mask[bi].item()),
+                    "diffuse_mask": bool(diffuse_mask[bi].item()),
+                    "repeat_degen_detected": bool(repeat_degen_mask[bi].item()),
                     "collapse_candidate": bool((spike_mask[bi] & diffuse_mask[bi]).item()) if collapse_on_diffuse else False,
                 }
                 _add_topk_trace_fields(
@@ -1137,6 +1215,25 @@ def generate_lead(model, tokenizer, **kwargs):
     lead_veto_recent_repeat_window = kwargs.pop("lead_veto_recent_repeat_window", 32)
     lead_veto_recent_repeat_tau = kwargs.pop("lead_veto_recent_repeat_tau", 0.35)
     lead_disable_simple_visual_anchor = kwargs.pop("lead_disable_simple_visual_anchor", False)
+    lead_force_normal = kwargs.pop("lead_force_normal", False)
+    lead_initial_soft_only = kwargs.pop("lead_initial_soft_only", False)
+    lead_initial_transition_only = kwargs.pop("lead_initial_transition_only", False)
+    lead_initial_transition_delay_steps = int(kwargs.pop("lead_initial_transition_delay_steps", 0) or 0)
+    if lead_initial_transition_delay_steps < 0:
+        lead_initial_transition_delay_steps = 0
+    lead_disable_step0_linebreak_mix = kwargs.pop("lead_disable_step0_linebreak_mix", False)
+    lead_disable_to_normal_transition = kwargs.pop("lead_disable_to_normal_transition", False)
+    lead_soft_quota_ratio = float(kwargs.pop("lead_soft_quota_ratio", 0.0) or 0.0)
+    lead_format_cooldown = kwargs.pop("lead_format_cooldown", False)
+    format_cooldown_steps = kwargs.pop("format_cooldown_steps", 0)
+    format_cooldown_min_step = kwargs.pop("format_cooldown_min_step", 0)
+    format_cooldown_highrisk_only = kwargs.pop("format_cooldown_highrisk_only", False)
+    format_cooldown_normal_steps = kwargs.pop("format_cooldown_normal_steps", None)
+    format_cooldown_highrisk_steps = kwargs.pop("format_cooldown_highrisk_steps", None)
+    format_cooldown_max_active = kwargs.pop("format_cooldown_max_active", 0)
+    format_cooldown_entropy_min = kwargs.pop("format_cooldown_entropy_min", None)
+    format_cooldown_top1_max = kwargs.pop("format_cooldown_top1_max", None)
+    format_cooldown_margin_max = kwargs.pop("format_cooldown_margin_max", None)
 
     # ============================================
 
@@ -1179,10 +1276,15 @@ def generate_lead(model, tokenizer, **kwargs):
     all_generated = [input_ids[i].clone().tolist() for i in range(batch_size)]
     prompt_lens = [len(ids) for ids in all_generated]
     unfinished_idx = list(range(batch_size)) # bs >= 1 is supported
-    mode = torch.zeros(batch_size, dtype=torch.long, device=device)  # 0: soft, 1: normal
+    delay_initial_transition = lead_initial_transition_only and lead_initial_transition_delay_steps > 0
+    start_normal = lead_force_normal or delay_initial_transition
+    mode = torch.ones(batch_size, dtype=torch.long, device=device) if start_normal else torch.zeros(batch_size, dtype=torch.long, device=device)  # 0: soft, 1: normal
     mode_stay_steps = torch.zeros(batch_size, dtype=torch.long, device=device)
     locked_normal_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
     entropy_history = [[] for _ in range(batch_size)]
+    lead_soft_quota_counts = [0 for _ in range(batch_size)]
+    format_cooldowns = [0 for _ in range(batch_size)]
+    format_cooldown_active_counts = [0 for _ in range(batch_size)]
     
     if max_switch_count is not None:
         switch_count = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -1251,6 +1353,19 @@ def generate_lead(model, tokenizer, **kwargs):
                 injecting[done_mask] = False
         
         cur_entropy = -(probs_original * (probs_original.clamp(min=1e-8).log())).sum(dim=-1)
+        to_normal = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        to_soft = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        delayed_transition_entry = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        delayed_transition_exit = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        if delay_initial_transition:
+            delayed_transition_entry = (
+                torch.full((cur_batch,), step == lead_initial_transition_delay_steps, dtype=torch.bool, device=device)
+                & (~locked_normal_mask)
+            )
+            delayed_transition_exit = (
+                torch.full((cur_batch,), step == lead_initial_transition_delay_steps + 1, dtype=torch.bool, device=device)
+                & (~locked_normal_mask)
+            )
         if step == 0:
             cur_ref_entropy = cur_entropy.clone()
         else:
@@ -1258,6 +1373,10 @@ def generate_lead(model, tokenizer, **kwargs):
             allow_switch = (mode_stay_steps >= window_size)
             to_normal = (mode == 0) & (cur_entropy < cur_ref_entropy) & (cur_entropy < b2)
             to_soft = (mode == 1) & (cur_entropy > cur_ref_entropy) & allow_switch & (~locked_normal_mask) & (cur_entropy > b1)
+            if lead_force_normal or lead_initial_soft_only or lead_initial_transition_only:
+                to_soft = torch.zeros_like(to_soft)
+            if delay_initial_transition:
+                to_normal = to_normal | delayed_transition_exit
 
             
             if (to_normal.any() or to_soft.any()) and step % 50 == 0:  # 每50步打印一次
@@ -1265,8 +1384,11 @@ def generate_lead(model, tokenizer, **kwargs):
             
             mode[to_normal] = 1
             mode[to_soft] = 0
+            mode[delayed_transition_entry] = 0
             mode_stay_steps[to_normal | to_soft] = 0
+            mode_stay_steps[delayed_transition_entry] = 0
             cur_ref_entropy[to_normal | to_soft] = cur_entropy[to_normal | to_soft]
+            cur_ref_entropy[delayed_transition_entry] = cur_entropy[delayed_transition_entry]
 
             #输出表明print
             if to_normal.any() or to_soft.any():
@@ -1283,6 +1405,15 @@ def generate_lead(model, tokenizer, **kwargs):
             is_math_token = (next_tokens.unsqueeze(-1) == math_ids_tensor).any(dim=-1)
             is_normal[is_math_token] = True
         is_soft = ~is_normal
+        if lead_force_normal:
+            is_soft = torch.zeros_like(is_soft)
+        elif lead_initial_soft_only:
+            is_soft = is_soft & (step == 0)
+        elif lead_initial_transition_only:
+            if delay_initial_transition:
+                is_soft = delayed_transition_entry
+            else:
+                is_soft = is_soft & (step == 0)
         
         normal_emb = E[next_tokens]
         soft_emb = torch.matmul(probs_original, E)
@@ -1295,6 +1426,10 @@ def generate_lead(model, tokenizer, **kwargs):
         )
         lead_soft_veto_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         lead_veto_candidate = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        lead_soft_quota_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        lead_format_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        lead_format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
+        lead_highrisk_format_token_mask = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         if lead_soft_veto_on_diffuse:
             spike_mask, _, _ = _entropy_spike_mask(
                 raw_entropy=cur_entropy,
@@ -1332,9 +1467,44 @@ def generate_lead(model, tokenizer, **kwargs):
                     continue
                 lead_soft_veto_mask[bi] = True
 
+        if lead_format_cooldown and int(format_cooldown_steps) > 0 and step >= int(format_cooldown_min_step):
+            for bi, orig in enumerate(unfinished_idx):
+                token_text = tokenizer.decode(
+                    [int(next_tokens[bi].item())],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                is_highrisk = _is_high_risk_format_token_text(token_text)
+                is_format = is_highrisk if format_cooldown_highrisk_only else _is_format_token_text(token_text)
+                lead_highrisk_format_token_mask[bi] = is_highrisk
+                if is_format and (
+                    format_cooldown_entropy_min is not None
+                    or format_cooldown_top1_max is not None
+                    or format_cooldown_margin_max is not None
+                ):
+                    unstable = False
+                    if format_cooldown_entropy_min is not None:
+                        unstable = unstable or (
+                            float(cur_entropy[bi].item()) >= float(format_cooldown_entropy_min)
+                        )
+                    if format_cooldown_top1_max is not None:
+                        unstable = unstable or (
+                            float(raw_top1_prob[bi].item()) <= float(format_cooldown_top1_max)
+                        )
+                    if format_cooldown_margin_max is not None:
+                        unstable = unstable or (
+                            float(raw_margin[bi].item()) <= float(format_cooldown_margin_max)
+                        )
+                    is_format = unstable
+                lead_format_token_mask[bi] = is_format
+                lead_format_mask[bi] = is_format or format_cooldowns[orig] > 0
+                if int(format_cooldown_max_active) > 0 and format_cooldown_active_counts[orig] >= int(format_cooldown_max_active):
+                    lead_format_mask[bi] = False
+
         alpha = alpha_0 + (1 - alpha_0) * float(step) / float(max_new_tokens)
         if step == 0:
-            soft_emb = 0.9 * soft_emb + 0.1 * line_break_emb
+            if not lead_disable_step0_linebreak_mix:
+                soft_emb = 0.9 * soft_emb + 0.1 * line_break_emb
         else:
             mixed_emb = alpha * soft_emb + a * (1 - alpha) * start_thinking_emb
             
@@ -1345,10 +1515,21 @@ def generate_lead(model, tokenizer, **kwargs):
             print(f"[LEAD] Step {step}: alpha={alpha:.3f}, beta={beta:.3f}, soft_ratio={(mode==0).float().mean():.2f}")
 
 
-        if step > 0:
+        if step > 0 and not lead_initial_soft_only and not lead_disable_to_normal_transition:
             mixed_emb = beta * soft_emb + (1 - beta) * end_thinking_emb
             normal_emb = torch.where(to_normal[:, None], mixed_emb, normal_emb)
-        is_soft = is_soft & (~lead_soft_veto_mask)
+        if (
+            lead_soft_quota_ratio > 0.0
+            and not lead_force_normal
+            and not lead_initial_soft_only
+            and not lead_initial_transition_only
+        ):
+            for bi, orig in enumerate(unfinished_idx):
+                target_count = int(math.ceil(float(lead_soft_quota_ratio) * float(step + 1)))
+                if lead_soft_quota_counts[orig] < target_count and not bool(locked_normal_mask[bi].item()):
+                    lead_soft_quota_mask[bi] = True
+            is_soft = is_soft | lead_soft_quota_mask
+        is_soft = is_soft & (~lead_soft_veto_mask) & (~lead_format_mask)
         last_emb = torch.where(is_soft[:, None], soft_emb, normal_emb)
 
         if max_switch_count is not None and step > 0:
@@ -1384,6 +1565,33 @@ def generate_lead(model, tokenizer, **kwargs):
             token_id = next_tokens[bi].item()
             all_generated[orig].append(token_id)
             if token_trace is not None:
+                phase = (
+                    "early"
+                    if step <= 128
+                    else "mid" if step <= 512 else "late"
+                )
+                veto_active = bool(lead_soft_veto_mask[bi].item())
+                format_active = bool(lead_format_mask[bi].item())
+                if veto_active:
+                    route_signal = "diffuse_repeat_degen"
+                    route_action = "hard_discrete"
+                    route_priority = 90
+                elif format_active:
+                    route_signal = (
+                        "highrisk_format_uncertain"
+                        if bool(lead_highrisk_format_token_mask[bi].item())
+                        else "format_uncertain"
+                    )
+                    route_action = "format_cooldown"
+                    route_priority = 80
+                elif bool(is_soft[bi].item()):
+                    route_signal = "lead_soft_quota" if bool(lead_soft_quota_mask[bi].item()) else "lead_soft"
+                    route_action = "lead_soft_quota" if bool(lead_soft_quota_mask[bi].item()) else "lead_soft"
+                    route_priority = 20 if bool(lead_soft_quota_mask[bi].item()) else 10
+                else:
+                    route_signal = "lead_normal"
+                    route_action = "normal"
+                    route_priority = 0
                 record = {
                     "step": int(step),
                     "batch_index": int(orig),
@@ -1392,8 +1600,45 @@ def generate_lead(model, tokenizer, **kwargs):
                     "filtered_entropy": float(filtered_entropy[bi].item()),
                         "selected_prob": float(probs[bi, next_tokens[bi]].item()),
                         "mode": "soft" if bool(is_soft[bi].item()) else "normal",
+                        "generation_phase": phase,
+                        "route_signal": route_signal,
+                        "route_action": route_action,
+                        "route_priority": int(route_priority),
+                        "route_suppressed_by": [],
                         "lead_soft_veto": bool(lead_soft_veto_mask[bi].item()),
                         "lead_veto_candidate": bool(lead_veto_candidate[bi].item()),
+                        "lead_disable_step0_linebreak_mix": bool(lead_disable_step0_linebreak_mix),
+                        "lead_disable_to_normal_transition": bool(lead_disable_to_normal_transition),
+                        "lead_initial_transition_delay_steps": int(lead_initial_transition_delay_steps),
+                        "lead_delayed_transition_entry": bool(delayed_transition_entry[bi].item()),
+                        "lead_delayed_transition_exit": bool(delayed_transition_exit[bi].item()),
+                        "to_normal": bool(to_normal[bi].item()),
+                        "to_soft": bool(to_soft[bi].item()),
+                        "lead_soft_quota_active": bool(lead_soft_quota_mask[bi].item()),
+                        "lead_soft_quota_ratio": float(lead_soft_quota_ratio),
+                        "format_cooldown_active": bool(lead_format_mask[bi].item()),
+                        "format_token": bool(lead_format_token_mask[bi].item()),
+                        "is_highrisk_format_token": bool(lead_highrisk_format_token_mask[bi].item()),
+                        "format_cooldown_highrisk_only": bool(format_cooldown_highrisk_only),
+                        "format_cooldown_min_step": int(format_cooldown_min_step),
+                        "format_cooldown_normal_steps": (
+                            None if format_cooldown_normal_steps is None else int(format_cooldown_normal_steps)
+                        ),
+                        "format_cooldown_highrisk_steps": (
+                            None if format_cooldown_highrisk_steps is None else int(format_cooldown_highrisk_steps)
+                        ),
+                        "format_cooldown_max_active": int(format_cooldown_max_active),
+                        "format_cooldown_entropy_min": (
+                            None if format_cooldown_entropy_min is None else float(format_cooldown_entropy_min)
+                        ),
+                        "format_cooldown_top1_max": (
+                            None if format_cooldown_top1_max is None else float(format_cooldown_top1_max)
+                        ),
+                        "format_cooldown_margin_max": (
+                            None if format_cooldown_margin_max is None else float(format_cooldown_margin_max)
+                        ),
+                        "format_cooldown_active_count": int(format_cooldown_active_counts[orig]),
+                        "format_cooldown_remaining": int(format_cooldowns[orig]),
                         "raw_top1_prob": float(raw_top1_prob[bi].item()),
                         "raw_margin": float(raw_margin[bi].item()),
                         "alpha": float(alpha),
@@ -1411,7 +1656,33 @@ def generate_lead(model, tokenizer, **kwargs):
             if stream_callback is not None:
                 stream_callback(all_generated[orig][-1])
         for bi in range(cur_batch):
+            orig = unfinished_idx[bi]
+            if bool(is_soft[bi].item()):
+                lead_soft_quota_counts[orig] += 1
             entropy_history[bi].append(float(cur_entropy[bi].item()))
+            if lead_format_cooldown and int(format_cooldown_steps) > 0:
+                if step < int(format_cooldown_min_step):
+                    format_cooldowns[orig] = 0
+                elif int(format_cooldown_max_active) > 0 and format_cooldown_active_counts[orig] >= int(format_cooldown_max_active):
+                    format_cooldowns[orig] = 0
+                elif bool(lead_format_token_mask[bi].item()):
+                    token_text = tokenizer.decode(
+                        [int(next_tokens[bi].item())],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    is_highrisk = _is_high_risk_format_token_text(token_text)
+                    if is_highrisk and format_cooldown_highrisk_steps is not None:
+                        steps = int(format_cooldown_highrisk_steps)
+                    elif (not is_highrisk) and format_cooldown_normal_steps is not None:
+                        steps = int(format_cooldown_normal_steps)
+                    else:
+                        steps = int(format_cooldown_steps)
+                    format_cooldowns[orig] = max(0, steps - 1)
+                elif format_cooldowns[orig] > 0:
+                    format_cooldowns[orig] -= 1
+                if bool(lead_format_mask[bi].item()):
+                    format_cooldown_active_counts[orig] += 1
         
         if tokenizer.eos_token_id is not None:
             cur_finished = (next_tokens == tokenizer.eos_token_id)

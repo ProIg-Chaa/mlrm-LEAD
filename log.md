@@ -1029,3 +1029,174 @@ VStar / reanchor 相关脚本已移动到：
 - `answer_zone_discrete`
   - `output/experiments/20260520_114012/pure_soft_answer_zone_discrete_vstar_full/answer_zone_discrete_gpu1`
   - PID `2828661`
+
+## 2026-05-30: LEAD 开头 transition 消融与跨数据集验证
+
+最新检查发现，标准 LEAD 在 VStar 上平均每个样本实际触发 soft 介入次数很少，约为 `1.7` 次/样本；同时 LEAD 固定在每个样本第 0 步先走一次 soft / transition 机制。因此本轮开始验证一个新的关键假设：
+
+> LEAD 的主要收益可能并不来自后续稀疏动态 soft trigger，而来自 generation 开头 latent / soft transition 对整条 reasoning trajectory 的初始化影响。
+
+新增和使用的主要实验目录：
+
+- `output/experiments/20260529_163618/vstar_lead_cot_sanity_matrix`
+- `output/experiments/20260529_225807/vstar_lead_soft_quota_sweep`
+- `output/experiments/20260530_013153/cross_dataset_lead_transition_quota`
+
+VStar sanity matrix：
+
+- `cot_orign_greedy`: `131/191 = 68.59%`
+- `lead_force_normal`: `131/191 = 68.59%`
+- `initial_soft_only`: `132/191 = 69.11%`
+- `initial_transition_only`: `138/191 = 72.25%`
+- `initial_transition_only_no_anchor`: `138/191 = 72.25%`
+- `lead`: `139/191 = 72.77%`
+
+关键结论：
+
+- `lead_force_normal` 与 COT 同分，说明去掉 soft / transition 后 LEAD 路径本身没有额外收益。
+- `initial_soft_only` 只有 `132/191`，说明“只第 0 步 soft”不是主要收益来源。
+- `initial_transition_only` 只比 full LEAD 少 1 题，且 `no_anchor` 版本同分，说明主要收益来自开头 transition，而不是 simple visual anchor。
+
+跨数据集结果：
+
+- RealWorldQA fixed:
+  - `lead`: `129/200 = 64.50%`
+  - `initial_transition_only`: `127/200 = 63.50%`
+  - `quota20`: `126/200 = 63.00%`
+  - `quota05_guard`: `134/200 = 67.00%`
+- VisuLogic300:
+  - `lead`: `74/300 = 24.67%`
+  - `initial_transition_only`: `85/300 = 28.33%`
+  - `quota20`: `69/300 = 23.00%`
+  - `quota05_guard`: `67/300 = 22.33%`
+- MMVP:
+  - `lead`: `211/300 = 70.33%`, pair acc `42.00%`
+  - `initial_transition_only`: `211/300 = 70.33%`, pair acc `42.00%`
+  - `quota20`: `205/300 = 68.33%`, pair acc `42.67%`
+  - `quota05_guard`: `211/300 = 70.33%`, pair acc `42.67%`
+
+逐样本翻转结论：
+
+- MMVP 上 `initial_transition_only` 与 full LEAD item-level 和 pair-level 都完全一致，fixed/damaged 都是 `0/0`。
+- RealWorldQA fixed 上 `initial_transition_only` 相对 full LEAD 为 fixed `1`、damaged `3`、net `-2`；`quota05_guard` 为 fixed `11`、damaged `6`、net `+5`。
+- VisuLogic300 上 `initial_transition_only` 相对 full LEAD 明显正向，默认评估多 11 题；轻量逐样本复核约 fixed `40`、damaged `27`、net `+13`。收益主要来自 Attribute / Other，Spatial Reasoning 有下降。
+
+当前方法含义：
+
+```text
+不是：
+高熵 / 不确定 token 上频繁动态 soft 介入 -> 性能提升
+
+更像是：
+generation 起始阶段的一次 latent transition -> 改变后续整条 reasoning trajectory
+```
+
+后续建议：
+
+1. 优先拆解 `initial_transition` 本身，例如 `k1/k2/k4/k8`、`no_anchor`、`random/mean embedding control`、是否需要 entropy 条件。
+2. 后续 soft quota 只保留非常保守的版本观察，例如 `initial_transition + quota05_guard`。
+3. 不建议继续优先扫大 quota；`quota20` 在 RealWorldQA、MMVP item、VisuLogic 上都不稳定。
+4. 当前发现已经整理成独立报告：`result/5-27/lead_initial_transition_cross_dataset_20260530.md`。
+## 2026-06-02 Early Trajectory Commitment 机制优先重跑
+
+本轮按新的主线重跑计划落地：验证多模态推理轨迹是否在生成极早期被锁定，以及 LEAD 的主要收益是否来自开头 `soft -> normal` transition，而不是中后段 entropy-gated 动态触发。
+
+代码改动：
+- 新增 CLI/config/生成透传参数：`--lead_initial_transition_delay_steps N`。
+- `N=0` 等价现有 `initial_transition_only`。
+- `N>0` 时先正常 hard decoding N 个生成 step，在第 N 步插入一次 soft latent 扰动，并在第 N+1 步执行对应的 `soft -> normal` transition，之后继续 normal。
+- `token_entropy_full.jsonl` 的 trace 增加 `lead_initial_transition_delay_steps`、`lead_delayed_transition_entry`、`lead_delayed_transition_exit`、`to_normal`、`to_soft` 字段，便于后续 early-token divergence 分析。
+
+新增脚本：
+- `script/exp5_27/run_rerun_early_path_dependence_mechanism.sh`
+- `script/exp5_27/summarize_rerun_early_path_dependence.py`
+- `script/exp5_27/analyze_early_token_divergence.py`
+
+实验矩阵：
+- Phase 1：VStar clean component controls，包含 COT、LEAD force normal、full LEAD、initial soft、initial transition、no_to_normal、no_linebreak、no_anchor、no_linebreak_no_to_normal。
+- Phase 2：VStar timing curve，`transition_step0/1/2/4/8/16/32`。
+- Phase 2 cross projection：把 `step0/4/16/32` 外推到 MMVP、VisuLogic300、RealWorldQA fixed200。
+- Phase 3：VStar/MMVP/VisuLogic300/RealWorldQA fixed200 的最小跨数据集矩阵，包含 COT、force normal、full LEAD、initial soft、initial transition、no_to_normal、no_anchor、quota05_guard。
+
+输出根目录：
+`output/experiments/20260602_220321/rerun_early_path_dependence_mechanism`
+
+启动状态：
+- GPU0 queue PID: `2950179`
+- GPU1 queue PID: `2950180`
+- 当前首批 run 已启动：GPU0 `cot_orign_greedy`，GPU1 `lead_force_normal`。
+- 每个 run 启动前都会执行 `python -m py_compile main.py lead/inference.py lead/generation_utils.py`。
+- 汇总命令：`bash output/experiments/20260602_220321/rerun_early_path_dependence_mechanism/compare_after_done.sh`
+
+预期输出：
+- `summary.json`
+- `summary.md`
+- `pairwise_deltas.json`
+- MMVP 每个 run 的 `specialized_eval_report.json`
+- RealWorldQA fixed200 每个 run 的 `realworldqa_mcq_eval.json`
+- `early_token_divergence.md`
+
+
+## 2026-06-04 格式稳定与置信度扩散 Guard 重跑
+
+目标：把此前的 ormat_cooldown2 与 confidence-diffusion / late64 repeat veto 按 early trajectory commitment 同样的控制变量风格重跑，判断它们是主机制还是退化修复 guard。
+
+计划文档：
+esult/5-27/format_confidence_diffusion_rerun_plan_20260604.md
+
+新增 runner：script/exp5_27/run_rerun_format_confidence_diffusion_guard.sh
+
+正式输出目录：output/experiments/20260604_131704/rerun_format_confidence_diffusion_guard
+
+矩阵：
+- Phase 1 cross-dataset guard：VStar / MMVP / VisuLogic300 / RealWorldQA fixed200，每个数据集 11 个 run：COT、force normal、full LEAD、initial_transition_only、lead_format2、lead_diffuse_veto、lead_guard、quota05、quota05_format2、quota05_diffuse_veto、quota05_guard。
+- Phase 2 VStar pure-soft guard：pure_soft、pure_soft_format2、pure_soft_diffuse_collapse、pure_soft_guard。
+
+关键口径：
+- 不保存 --save_full_token_entropy，避免长 trace 写入触发 OSError: [Errno 7] Argument list too long。
+- 保留 --save_token_entropy --trace_topk 20，主表和 mean soft ratio 仍可汇总。
+- 汇总命令：ash output/experiments/20260604_131704/rerun_format_confidence_diffusion_guard/compare_after_done.sh
+
+启动状态：
+- GPU0 queue PID: 3082450
+- GPU1 queue PID: 3082451
+- 首批 run：GPU0 star/cot_orign_greedy，GPU1 star/lead_force_normal。
+- 当前仍处于模型加载/共享存储 I/O 阶段，尚未写出结果。
+
+## 2026-06-06 Guard 补跑与两条调参 sweep 启动
+
+用户要求：先把 20260604 guard 重跑中未完成的实验补完，然后启动两个调参方向：
+1. early transition delay refine；
+2. quota ratio / quota+format2 sweep。
+
+Guard 补跑目录：`output/experiments/20260604_131704/rerun_format_confidence_diffusion_guard`
+
+补跑策略：
+- 清理 26 个 missing run 的 partial `results/eval/token_entropy` 文件。
+- 先并行补 RealWorldQA fixed200 与 VStar pure-soft guard。
+- 再单进程串行补 VisuLogic300，避免两张卡同时跑 VisuLogic 再次触发系统 `Killed`。
+- Guard 补完后自动执行：`bash output/experiments/20260604_131704/rerun_format_confidence_diffusion_guard/compare_after_done.sh`
+
+接力脚本：`output/experiments/20260604_131704/rerun_format_confidence_diffusion_guard/continue_guard_then_start_tuning.sh`
+
+当前后台状态：
+- master PID: `3216578`
+- nonvis GPU0 queue PID: `3216584`
+- nonvis GPU1 queue PID: `3216585`
+- 当前首批补跑：RealWorldQA fixed200 `cot_orign_greedy_gpu0` 与 `lead_force_normal_gpu1`，已进入 CUDA。
+
+调参脚本：`script/exp5_27/run_tune_transition_delay_quota.sh`
+
+调参矩阵：
+- Direction 1：transition delay refine，补 MMVP/RealWorldQA/VisuLogic 的 `transition_step1/step2`。
+- Direction 2：quota ratio sweep，在 VStar/MMVP/RealWorldQA 上跑 `0.02/0.03/0.05/0.08` 及对应 `+format2`。
+- 调参输出目录将在 guard 补跑完成后由脚本自动生成，形如 `output/experiments/<STAMP>/tune_transition_delay_quota_format`。
+
+## 2026-06-15 Early Prefix Replay 因果实验
+
+- 在 `gpu11` 完成 early prefix replay 实验，输出目录：`output/experiments/20260615_early_prefix_replay/early_prefix_replay`。
+- 实验对象是 COT 错、`initial_transition_only` 对的样本：VStar 18 个，MMVP 12 个。
+- 方法：强制生成前 `8/16/32/64` 个 token 分别来自 COT 错误轨迹或 initial-transition 修复轨迹，然后切回普通 greedy COT 继续生成。
+- 结果：COT prefix 基本锁死错误轨迹，VStar 四个长度均为 `1/18`，MMVP 四个长度均为 `0/12`；initial-transition prefix 随长度增加明显恢复正确率，VStar 到 64 token 为 `14/18`，MMVP 到 32/64 token 分别为 `10/12`、`11/12`。
+- 结论：这比 early token divergence 更接近因果证据，说明 early transition 不是单纯格式修复，而是在前 32-64 token 内重定向了可延续的视觉推理轨迹；后续普通 greedy 会沿着早期轨迹继续展开。
+- 详细报告：`result/5-27/early_prefix_replay_report_20260615.md`。

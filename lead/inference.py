@@ -169,6 +169,13 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["max_switch_count"] = args.max_switch_count
             model_inputs["window_size"] = args.window_size
             model_inputs["lead_disable_simple_visual_anchor"] = args.lead_disable_simple_visual_anchor
+            model_inputs["lead_force_normal"] = args.lead_force_normal
+            model_inputs["lead_initial_soft_only"] = args.lead_initial_soft_only
+            model_inputs["lead_initial_transition_only"] = args.lead_initial_transition_only
+            model_inputs["lead_initial_transition_delay_steps"] = args.lead_initial_transition_delay_steps
+            model_inputs["lead_disable_step0_linebreak_mix"] = args.lead_disable_step0_linebreak_mix
+            model_inputs["lead_disable_to_normal_transition"] = args.lead_disable_to_normal_transition
+            model_inputs["lead_soft_quota_ratio"] = args.lead_soft_quota_ratio
             model_inputs["convergence_words"] = "</think>"
             model_inputs["lead_soft_veto_on_diffuse"] = args.lead_soft_veto_on_diffuse
             model_inputs["lead_veto_entropy_window"] = args.lead_veto_entropy_window
@@ -182,6 +189,16 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["lead_veto_repeat_ngram"] = args.lead_veto_repeat_ngram
             model_inputs["lead_veto_recent_repeat_window"] = args.lead_veto_recent_repeat_window
             model_inputs["lead_veto_recent_repeat_tau"] = args.lead_veto_recent_repeat_tau
+            model_inputs["lead_format_cooldown"] = args.lead_format_cooldown
+            model_inputs["format_cooldown_steps"] = args.format_cooldown_steps
+            model_inputs["format_cooldown_min_step"] = args.format_cooldown_min_step
+            model_inputs["format_cooldown_highrisk_only"] = args.format_cooldown_highrisk_only
+            model_inputs["format_cooldown_normal_steps"] = args.format_cooldown_normal_steps
+            model_inputs["format_cooldown_highrisk_steps"] = args.format_cooldown_highrisk_steps
+            model_inputs["format_cooldown_max_active"] = args.format_cooldown_max_active
+            model_inputs["format_cooldown_entropy_min"] = args.format_cooldown_entropy_min
+            model_inputs["format_cooldown_top1_max"] = args.format_cooldown_top1_max
+            model_inputs["format_cooldown_margin_max"] = args.format_cooldown_margin_max
             outputs = generate_lead(
                 model,
                 tokenizer,

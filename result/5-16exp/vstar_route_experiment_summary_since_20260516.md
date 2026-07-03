@@ -1,6 +1,6 @@
 # 2026-05-16 以来 VStar 路由实验阶段总结
 
-本文整理 2026-05-16 以来围绕 VStar、pure-soft、LEAD、format cooldown、低置信扩散坍缩、多信号混合等实验的主要脉络。主体只总结已经完成并分析过的实验；正在运行的 budget cap 实验不计入最终结论。
+本文整理 2026-05-16 以来围绕 VStar、pure-soft、LEAD、format cooldown、低置信扩散坍缩、多信号混合、轻量视觉 bias 与统一路由框架等实验的主要脉络。主体总结已经完成并分析过的实验，并更新到 2026-05-25 当前进度。
 
 ## 1. 总体问题
 
@@ -154,6 +154,38 @@ lambda * normal_emb + (1 - lambda) * soft_emb
 ```
 
 实验显示 `lambda=0.75` 和 `lambda=0.50` 都不如 hard discrete。
+
+### 3.10 image_pad visual bias
+
+含义：
+
+- 在 pure-soft 的 `soft_emb` 中混入 `<|image_pad|>` token 的 embedding：
+
+```python
+biased_soft_emb = (1 - lambda) * soft_emb + lambda * E[<|image_pad|>]
+```
+
+直觉：
+
+> 用非常轻量的视觉 anchor 给 soft 推理补一点视觉信息。
+
+实验显示该信号有明显阶段依赖：
+
+- full / early bias 会明显伤 VStar；
+- mid bias 相对安全，并在 VStar / VisuLogic 上有小幅收益；
+- late bias 最安全，但基本没有新增收益。
+
+### 3.11 phase gate
+
+当前阶段划分：
+
+| 阶段 | step 范围 | 当前观察 |
+|---|---|---|
+| early | `0-128` | VStar 上危险，MMVP 上有收益 |
+| mid | `129-512` | 当前最像通用安全收益区 |
+| late | `513+` | 安全但收益弱 |
+
+阶段实验说明，视觉信息不是不能用，而是不能在错误阶段粗暴注入。
 
 ## 4. 实验展开过程
 
@@ -355,6 +387,183 @@ output/experiments/20260520_194525/pure_soft_format_variable_and_mixed_vstar_ful
 
 > 全局弱化 discrete 强度会掉分。VStar 上 format 路由需要 hard discrete，不适合用 mixed embedding 简单替代。
 
+## 4.8 第八阶段：跨数据集 base / LEAD / bestcombo 对照
+
+实验目录：
+
+```text
+output/experiments/20260520_231938/cross_dataset_base_lead_bestcombo
+```
+
+代表性结果：
+
+| 数据集 | pure-soft | LEAD | bestcombo |
+|---|---:|---:|---:|
+| MMVP sample | - | 211/300 = 70.33% | 201/300 = 67.00% |
+| MMVP pair | - | 63/150 = 42.00% | 60/150 = 40.00% |
+| VisuLogic300 | 53/300 = 17.67% | 约 74-76/300 = 24.67%-25.33% | 73/300 = 24.33% |
+| VStar | 112/191 = 58.64% | 139/191 = 72.77% | 143/191 = 74.87% |
+
+注：
+
+- VStar bestcombo 在不同轻量抽取脚本中有时计为 `144/191`，但本文沿用项目 eval_report 中的 `143/191 = 74.87%` 作为阶段主表结果。
+- MMVP 使用修正后的 sample / pair 评估；pair 正确要求同一个 pair 两题都答对。
+
+阶段结论：
+
+> bestcombo 在 VStar 上明显有效，但在 MMVP 上不如 LEAD。这说明 format/collapse 路由解决的是 soft 推理退化，不等价于 LEAD 的视觉 anchor 能力；不同数据集需要不同 route profile。
+
+## 4.9 第九阶段：LEAD simple visual anchor 消融
+
+实验目录：
+
+```text
+output/experiments/20260521_152817/lead_simple_anchor_ablation_mmvp_visulogic_vstar
+```
+
+结果：
+
+| 数据集 | 原 LEAD | 关闭 simple anchor |
+|---|---:|---:|
+| MMVP sample | 211/300 = 70.33% | 209/300 = 69.67% |
+| MMVP pair | 63/150 = 42.00% | 61/150 = 40.67% |
+| VisuLogic300 | 74/300 = 24.67% | 65/300 = 21.67% |
+| VStar | 139/191 = 72.77% | 137/191 = 71.73% |
+
+阶段结论：
+
+> 原始 LEAD 确实包含一个轻量 `<|image_pad|>` anchor。它不是后续实验中的动态 attention anchor，但它有稳定收益，尤其在 VisuLogic 上更明显。这也支持“轻量视觉信息有用，但不能强注入”的判断。
+
+## 4.10 第十阶段：format 过度干预问题
+
+实验目录：
+
+```text
+output/experiments/20260521_191535/format_overintervention_gates_mmvp_visulogic
+```
+
+核心结果：
+
+| 数据集 | bestcombo | gate_entropy10 | gate_top080_margin040 | gate_strict |
+|---|---:|---:|---:|---:|
+| MMVP sample | 201/300 = 67.00% | 194/300 = 64.67% | 192/300 = 64.00% | 195/300 = 65.00% |
+| MMVP pair | 60/150 = 40.00% | 56/150 = 37.33% | 55/150 = 36.67% | 58/150 = 38.67% |
+| VisuLogic300 | 73/300 = 24.33% | 53/300 = 17.67% | 66/300 = 22.00% | 67/300 = 22.33% |
+
+阶段结论：
+
+> 减少 format cooldown 触发并没有减少主要损伤，反而明显掉分。format cooldown 不是简单的过度干预，它是 pure-soft 稳定化的核心动作之一。
+
+## 4.11 第十一阶段：image_pad bias 全程 / entropy gate / phase gate
+
+### 4.11.1 full image_pad bias
+
+实验目录：
+
+```text
+output/experiments/20260522_125332/bestcombo_image_pad_bias_vstar_mmvp_visulogic
+```
+
+代表性结果：
+
+| 数据集 | bestcombo | full bias λ=0.05 |
+|---|---:|---:|
+| VStar | 143/191 = 74.87% | 135/191 = 70.68% |
+| MMVP sample | 201/300 = 67.00% | 207/300 = 69.00% |
+| MMVP pair | 60/150 = 40.00% | 63/150 = 42.00% |
+| VisuLogic300 | 73/300 = 24.33% | 约 74/300 = 24.67% |
+
+结论：
+
+> full visual bias 对 MMVP 有收益，但明显伤 VStar。视觉信息有用，但全程注入不稳定。
+
+### 4.11.2 entropy-gated image_pad bias
+
+实验目录：
+
+```text
+output/experiments/20260522_184028/bestcombo_image_pad_bias_entropy_gate
+```
+
+核心结果：
+
+| 数据集 | bestcombo | entropy>=1.0 | entropy>=1.5 | entropy>=2.0 |
+|---|---:|---:|---:|---:|
+| VStar | 143/191 = 74.87% | 133/191 = 69.63% | 142/191 = 74.35% | 132/191 = 69.11% |
+| MMVP sample | 201/300 = 67.00% | 208/300 = 69.33% | 199/300 = 66.33% | 198/300 = 66.00% |
+| VisuLogic300 | 73/300 = 24.33% | 67/300 = 22.33% | 69/300 = 23.00% | 62/300 = 20.67% |
+
+结论：
+
+> “高熵就加视觉”不成立。高熵 token 类型复杂，entropy gate 不能区分视觉不确定、format 不稳定、关系推理或低置信扩散。
+
+### 4.11.3 phase-gated image_pad bias
+
+实验目录：
+
+```text
+output/experiments/20260523_121058/bestcombo_image_pad_bias_phase_gate
+```
+
+结果：
+
+| 数据集 | bestcombo | full bias 0.05 | early | mid | late |
+|---|---:|---:|---:|---:|---:|
+| VStar | 143/191 = 74.87% | 135/191 = 70.68% | 135/191 = 70.68% | 约 144-145/191 = 75%+ | 143/191 = 74.87% |
+| MMVP sample | 201/300 = 67.00% | 207/300 = 69.00% | 207/300 = 69.00% | 201/300 = 67.00% | 201/300 = 67.00% |
+| MMVP pair | 60/150 = 40.00% | 63/150 = 42.00% | 63/150 = 42.00% | 60/150 = 40.00% | 60/150 = 40.00% |
+| VisuLogic300 | 73/300 = 24.33% | 约 74/300 = 24.67% | 73-74/300 | 76-77/300 = 25%+ | 71-72/300 |
+
+阶段结论：
+
+> early 视觉 bias 是 VStar 的主要伤害来源；mid 是当前最有价值的视觉注入窗口；late 安全但新增收益弱。MMVP 更吃 early visual bias，而 VStar 不能 early 加。
+
+## 4.12 第十二阶段：VStar early damage 集 lambda sweep
+
+实验目录：
+
+```text
+output/experiments/20260524_131252/vstar_damage_image_pad_lambda_sweep
+```
+
+破坏集定义：
+
+```text
+bestcombo 原本答对，但 early image_pad_bias λ=0.05 答错的 VStar 样本
+```
+
+样本数：
+
+```text
+18
+```
+
+结果：
+
+| 方法 | 破坏集正确率 |
+|---|---:|
+| no_bias bestcombo | 18/18 = 100.00% |
+| full λ=0.01 | 10/18 = 55.56% |
+| full λ=0.02 | 10/18 = 55.56% |
+| full λ=0.03 | 9/18 = 50.00% |
+| full λ=0.05 | 1/18 = 5.56% |
+| early λ=0.01 | 10/18 = 55.56% |
+| early λ=0.02 | 9/18 = 50.00% |
+| early λ=0.03 | 9/18 = 50.00% |
+| early λ=0.05 | 0/18 = 0.00% |
+| mid λ=0.01 | 16/18 = 88.89% |
+| mid λ=0.02 | 17/18 = 94.44% |
+| mid λ=0.03 | 17/18 = 94.44% |
+| mid λ=0.05 | 17/18 = 94.44% |
+| late λ=0.01 | 18/18 = 100.00% |
+| late λ=0.02 | 18/18 = 100.00% |
+| late λ=0.03 | 18/18 = 100.00% |
+| late λ=0.05 | 18/18 = 100.00% |
+
+阶段结论：
+
+> 破坏不是单纯因为 λ=0.05 太大，而是 early 视觉注入本身危险。即使 λ=0.01，early 仍会破坏 8/18 个原本正确样本。full bias 的主要伤害也来自 early 阶段。
+
 ## 5. Damaged 样本分析
 
 当前 best combo 相比 pure-soft baseline 的 damaged 样本为：
@@ -382,30 +591,70 @@ output/experiments/20260520_194525/pure_soft_format_variable_and_mixed_vstar_ful
 
 > 下一步不应继续全局削弱 cooldown2，而应保留 hard cooldown2，并增加 damaged-aware 保护门控。
 
-## 6. 当前正在验证的方向
+## 6. 统一路由框架准备
 
-当前正在运行：
+文档：
 
 ```text
-output/experiments/20260520_204403/pure_soft_format_budget_cap_vstar_full
+result/5-16exp/unified_routing_framework_direction1_20260524.md
 ```
 
-配置：
+代码准备：
 
-- `cooldown2_cap60`
-- `cooldown2_cap50`
-- `cooldown2_cap60_late64_repeat`
-- `cooldown2_cap50_late64_repeat`
+- `lead/generation_utils.py`：在 `generate_pure_soft(...)` 中新增 route annotation 字段；
+- `script/exp5_16/analyze_route_summary.py`：新增统一 route summary 脚本。
 
-目标：
+新增 trace 字段包括：
 
-> 每个样本最多允许 N 个 token 进入 format cooldown，从而限制过量 format 介入，尝试恢复 damaged 样本，同时保留 hard cooldown2 的稳定收益。
+- `generation_phase`
+- `route_signal`
+- `route_action`
+- `route_priority`
+- `route_suppressed_by`
+- `is_highrisk_format_token`
+- `visual_bias_candidate`
+- `visual_bias_effective`
+- `entropy_spike_mask`
+- `diffuse_mask`
+- `repeat_degen_detected`
 
-该实验尚未纳入本文结论。
+这些字段只用于记录，不改变当前生成行为。
 
-## 7. 阶段总结果
+统一路由框架当前抽象为：
 
-截至目前，已完成实验的最强配置仍是：
+```text
+token / sample state -> uncertainty type -> intervention action
+```
+
+第一版优先级：
+
+```text
+answer_zone / collapse hard discrete
+> format cooldown
+> mid image_pad visual bias
+> pure_soft
+```
+
+smoke test：
+
+```text
+/tmp/mlrm_route_smoke
+```
+
+验证结果：
+
+- `py_compile` 通过；
+- 小样本 pure-soft 能正常跑完；
+- `token_entropy_full.jsonl` 中 route 字段正常写出；
+- `analyze_route_summary.py` 能正常生成 route summary。
+
+阶段结论：
+
+> 当前已经具备“无行为变化地记录路由状态”的能力。后续每个 run 都能统计哪个 route 生效、哪个 route 被覆盖、fixed/damaged 样本分别由哪些 route 主导。
+
+## 7. 当前阶段总结果
+
+截至目前，已完成实验的 VStar 主线最强配置仍是：
 
 ```text
 cooldown2 + late64_repeat_gate
@@ -414,7 +663,7 @@ cooldown2 + late64_repeat_gate
 准确率：
 
 ```text
-143/191 = 74.87%
+143/191 = 74.87%（项目 eval_report 口径）
 ```
 
 核心结论：
@@ -425,6 +674,29 @@ cooldown2 + late64_repeat_gate
 4. late64 repeat gate 在 cooldown2 上小幅补强，形成当前 best `74.87%`。
 5. answer-zone 介入太晚，适合修格式但不能解决 reasoning 退化。
 6. highrisk-only、min-step、normal1_highrisk2、mixed lambda 都说明：不能简单削弱 hard discrete。
-7. 下一阶段应做 damaged-aware 保护门控，而不是继续降低整体路由强度。
-8. 视觉信息可以作为后续诊断方向，但当前主线仍然是生成路径稳定化。
+7. LEAD 的 simple `<|image_pad|>` anchor 有稳定收益，说明轻量视觉信息有用。
+8. 但 image_pad bias 不能全程或 early 粗暴注入；VStar damage 集显示 early λ=0.01 已经会破坏 8/18 个原本正确样本。
+9. mid 阶段 visual bias 是当前最有希望的视觉注入窗口；late 安全但收益弱。
+10. 高熵不等于视觉不足，entropy-gated visual bias 不稳定；必须把高熵 token 继续区分为 format / relation / visual / diffuse low-conf / answer 等类型。
+11. 下一阶段重点应从继续调单个阈值，转向统一路由框架：显式记录 `route_signal -> route_action`，分析 fixed/damaged 来源，再设计 Router v0。
 
+## 8. 下一步建议
+
+当前最合理的下一步不是继续扫 λ，而是先用新增 route annotation 做一轮“无行为变化复跑”和分析：
+
+1. 重跑 VStar bestcombo，确认新增 trace 不改变结果。
+2. 对 bestcombo 生成 route summary，统计 format/collapse/default 的分布。
+3. 重跑或选取 mid image_pad bias 配置，分析 visual bias 实际命中哪些 token、被 format/collapse 覆盖多少。
+4. 对 fixed/damaged 样本比较 route 分布，确认 damage 来自哪个 route。
+5. 在 VStar / MMVP / VisuLogic 上比较 route profile，决定是否需要数据集级 route profile。
+
+建议 Router v0 候选：
+
+```text
+format cooldown2
++ late64 repeat-gated collapse
++ mid-only image_pad_bias lambda=0.02 或 0.03
++ answer-zone hard discrete（可选）
+```
+
+但 Router v0 正式实验应建立在 route summary 结果之后。
