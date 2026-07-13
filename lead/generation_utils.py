@@ -1,5 +1,6 @@
 import os
 import re
+import copy
 import torch
 import torch.nn.functional as F
 import random
@@ -85,6 +86,182 @@ def _add_topk_trace_fields(record, tokenizer, raw_probs, filtered_probs, batch_i
             if len(filtered_topk) > 1
             else filtered_topk[0]["prob"]
         )
+
+
+def _embedding_geometry_record(hard_emb, soft_emb, route_emb, batch_index, visual_anchor=None):
+    """Return compact scalar geometry without retaining hidden tensors in the trace."""
+    hard = hard_emb[batch_index].detach().float()
+    soft = soft_emb[batch_index].detach().float()
+    route = route_emb[batch_index].detach().float()
+
+    def cosine(left, right):
+        return float(F.cosine_similarity(left.unsqueeze(0), right.unsqueeze(0), dim=-1).item())
+
+    record = {
+        "hard_emb_norm": float(hard.norm().item()),
+        "soft_emb_norm": float(soft.norm().item()),
+        "route_emb_norm": float(route.norm().item()),
+        "soft_hard_cosine": cosine(soft, hard),
+        "route_hard_cosine": cosine(route, hard),
+        "route_soft_cosine": cosine(route, soft),
+    }
+    if visual_anchor is not None:
+        anchor = visual_anchor.detach().float()
+        record["route_visual_anchor_cosine"] = cosine(route, anchor)
+        record["soft_visual_anchor_cosine"] = cosine(soft, anchor)
+    else:
+        record["route_visual_anchor_cosine"] = None
+        record["soft_visual_anchor_cosine"] = None
+    return record
+
+
+def _forced_answer_probe_from_route(
+    model,
+    tokenizer,
+    route_emb,
+    attention_mask,
+    past_key_values,
+    cache_position,
+    gold_choice,
+    choice_case="upper",
+    prompt_hidden_states=None,
+    visual_token_mask=None,
+    prompt_len=None,
+    visual_attn_last_k=4,
+):
+    """Probe A-E after a forced answer marker on an isolated cache copy."""
+    result = {
+        "available": False,
+        "interpretation": "forced-answer diagnostic; not natural-generation confidence",
+        "gold_choice": gold_choice,
+    }
+    if route_emb.shape[0] != 1 or past_key_values is None:
+        result["reason"] = "probe_requires_batch1_and_cache"
+        return result
+    try:
+        marker = "\n</think>\nAnswer: ("
+        marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+        choice_ids = {}
+        choice_symbols = "abcde" if choice_case == "lower" else "ABCDE"
+        for normalized_choice, choice_symbol in zip("ABCDE", choice_symbols):
+            encoded = tokenizer.encode(choice_symbol, add_special_tokens=False)
+            if len(encoded) != 1:
+                result["reason"] = f"choice_{choice_symbol}_is_not_single_token"
+                return result
+            choice_ids[normalized_choice] = int(encoded[0])
+
+        probe_cache = copy.deepcopy(past_key_values)
+        probe_mask = torch.cat([
+            attention_mask,
+            torch.ones((1, 1), dtype=attention_mask.dtype, device=attention_mask.device),
+        ], dim=1)
+        probe_position = cache_position.clone()
+        with torch.no_grad():
+            outputs = model(
+                inputs_embeds=route_emb.unsqueeze(1),
+                attention_mask=probe_mask,
+                past_key_values=probe_cache,
+                cache_position=probe_position,
+                use_cache=True,
+                output_attentions=visual_token_mask is not None,
+                output_hidden_states=prompt_hidden_states is not None,
+                return_dict=True,
+            )
+        try:
+            attn_summary = None
+            if visual_token_mask is not None and getattr(outputs, "attentions", None):
+                attn_summary = _summarize_visual_attention(
+                    attn_layers=outputs.attentions,
+                    visual_token_mask=visual_token_mask,
+                    prompt_len=int(prompt_len or visual_token_mask.shape[1]),
+                    attn_last_k=int(visual_attn_last_k),
+                )
+            if attn_summary is not None:
+                available = bool(attn_summary["available"][0].item())
+                result.update({
+                    "event_visual_attn_available": available,
+                    "event_visual_attn_last_k": int(visual_attn_last_k),
+                    "event_visual_attn_mass": float(attn_summary["mass"][0].item()),
+                    "event_visual_attn_top1": float(attn_summary["top1"][0].item()),
+                    "event_visual_attn_top4_sum": float(attn_summary["top4_sum"][0].item()),
+                    "event_visual_attn_entropy": (
+                        float(attn_summary["entropy"][0].item()) if available else None
+                    ),
+                })
+            else:
+                result["event_visual_attn_available"] = False
+                result["event_visual_attn_reason"] = "model_attention_not_exposed"
+
+            if prompt_hidden_states is not None and getattr(outputs, "hidden_states", None):
+                alignment = _summarize_hidden_visual_alignment(
+                    current_hidden=outputs.hidden_states[-1][:, -1, :],
+                    prompt_hidden_states=prompt_hidden_states,
+                    visual_token_mask=visual_token_mask,
+                    top_k=4,
+                )
+                align_available = bool(alignment["available"][0].item())
+                result.update({
+                    "event_hidden_visual_align_available": align_available,
+                    "event_hidden_visual_align_max": (
+                        float(alignment["max"][0].item()) if align_available else None
+                    ),
+                    "event_hidden_visual_align_top4_mean": (
+                        float(alignment["topk_mean"][0].item()) if align_available else None
+                    ),
+                    "event_hidden_visual_align_token_count": int(alignment["token_count"][0].item()),
+                })
+            else:
+                result["event_hidden_visual_align_available"] = False
+                result["event_hidden_visual_align_reason"] = "prompt_or_current_hidden_state_missing"
+        except Exception as diagnostic_exc:
+            result.update({
+                "event_visual_attn_available": False,
+                "event_hidden_visual_align_available": False,
+                "event_visual_diagnostic_error_type": type(diagnostic_exc).__name__,
+                "event_visual_diagnostic_error_message": str(diagnostic_exc),
+            })
+        probe_cache = outputs.past_key_values
+        probe_position = probe_position[-1:] + 1
+        for marker_id in marker_ids:
+            probe_mask = torch.cat([
+                probe_mask,
+                torch.ones((1, 1), dtype=probe_mask.dtype, device=probe_mask.device),
+            ], dim=1)
+            token = torch.tensor([[marker_id]], dtype=torch.long, device=route_emb.device)
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=token,
+                    attention_mask=probe_mask,
+                    past_key_values=probe_cache,
+                    cache_position=probe_position,
+                    use_cache=True,
+                )
+            probe_cache = outputs.past_key_values
+            probe_position = probe_position[-1:] + 1
+
+        probs = F.softmax(outputs.logits[:, -1, :].float(), dim=-1)[0]
+        choice_probs = {choice: float(probs[token_id].item()) for choice, token_id in choice_ids.items()}
+        gold = str(gold_choice or "").upper()[:1]
+        if gold not in choice_probs:
+            result["reason"] = "gold_choice_not_in_A_to_E"
+            result["choice_probs"] = choice_probs
+            return result
+        best_other = max(prob for choice, prob in choice_probs.items() if choice != gold)
+        result.update({
+            "available": True,
+            "marker": marker,
+            "choice_case": choice_case,
+            "choice_token_ids": choice_ids,
+            "choice_probs": choice_probs,
+            "gold_margin": choice_probs[gold] - best_other,
+            "predicted_choice": max(choice_probs, key=choice_probs.get),
+        })
+        return result
+    except Exception as exc:
+        result["reason"] = "probe_exception"
+        result["error_type"] = type(exc).__name__
+        result["error_message"] = str(exc)
+        return result
 
 
 def _entropy_spike_mask(raw_entropy, entropy_history, window, alpha, min_history, min_entropy):
@@ -437,6 +614,13 @@ def generate_pure_soft(model, tokenizer, **kwargs):
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
     trace_topk = kwargs.pop("trace_topk", 0)
+    trace_event_geometry = bool(kwargs.pop("trace_event_geometry", False))
+    trace_event_steps = {int(value) for value in kwargs.pop("trace_event_steps", [0, 1, 2, 4, 8, 16, 32])}
+    trace_route_override_step = int(kwargs.pop("trace_route_override_step", -1))
+    trace_route_override_kind = str(kwargs.pop("trace_route_override_kind", "none"))
+    trace_forced_answer_probe = bool(kwargs.pop("trace_forced_answer_probe", False))
+    trace_probe_gold_choice = kwargs.pop("trace_probe_gold_choice", None)
+    trace_probe_choice_case = kwargs.pop("trace_probe_choice_case", "upper")
     collapse_on_diffuse = kwargs.pop("collapse_on_diffuse", False)
     collapse_entropy_window = kwargs.pop("collapse_entropy_window", 16)
     collapse_entropy_alpha = kwargs.pop("collapse_entropy_alpha", 2.0)
@@ -468,6 +652,9 @@ def generate_pure_soft(model, tokenizer, **kwargs):
         attention_mask = torch.ones_like(input_ids, device=input_ids.device)
 
     batch_size, device = input_ids.shape[0], input_ids.device
+    prompt_len = input_ids.shape[1]
+    visual_token_mask = _build_visual_token_mask(input_ids, tokenizer)
+    prompt_hidden_states = None
     E = model.get_input_embeddings().weight
     image_pad_emb = None
     if image_pad_bias and float(image_pad_bias_lambda) > 0.0:
@@ -508,9 +695,17 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                 "cache_position": cache_position,
             }
 
+        need_prompt_hidden = trace_event_geometry and past_key_values is None
         with torch.no_grad():
-            outputs = model(**model_inputs, use_cache=True)
+            outputs = model(
+                **model_inputs,
+                use_cache=True,
+                output_hidden_states=need_prompt_hidden,
+                return_dict=True,
+            )
         past_key_values = outputs.past_key_values
+        if need_prompt_hidden and getattr(outputs, "hidden_states", None):
+            prompt_hidden_states = outputs.hidden_states[-1][:, :prompt_len, :].detach()
         if vision_inputs:
             vision_inputs = {}
         cache_position = cache_position[-1:] + 1
@@ -678,6 +873,26 @@ def generate_pure_soft(model, tokenizer, **kwargs):
         last_emb = biased_soft_emb
         last_emb = torch.where(format_mask[:, None], format_emb, last_emb)
         last_emb = torch.where((collapse_mask | answer_zone_mask)[:, None], normal_emb, last_emb)
+        route_override_active = step == trace_route_override_step and trace_route_override_kind != "none"
+        if route_override_active:
+            if trace_route_override_kind == "hard":
+                last_emb = normal_emb
+            elif trace_route_override_kind == "raw_soft":
+                last_emb = soft_emb
+            elif trace_route_override_kind == "method_soft":
+                last_emb = biased_soft_emb
+            else:
+                raise ValueError(f"Unsupported trace_route_override_kind={trace_route_override_kind}")
+        forced_answer_probe = None
+        if trace_forced_answer_probe and step == trace_route_override_step:
+            forced_answer_probe = _forced_answer_probe_from_route(
+                model, tokenizer, last_emb, attention_mask, past_key_values,
+                cache_position, trace_probe_gold_choice,
+                choice_case=trace_probe_choice_case,
+                prompt_hidden_states=prompt_hidden_states,
+                visual_token_mask=visual_token_mask,
+                prompt_len=prompt_len,
+            )
 
         for bi, orig in enumerate(unfinished_idx):
             token_id = next_tokens[bi].item()
@@ -795,11 +1010,36 @@ def generate_pure_soft(model, tokenizer, **kwargs):
                     "collapse_entropy_history_count": int(entropy_history_count[bi].item()),
                     "raw_top1_prob": float(raw_top1_prob[bi].item()),
                     "raw_margin": float(raw_margin[bi].item()),
+                    "route_override_active": bool(route_override_active),
+                    "route_override_kind": trace_route_override_kind if route_override_active else None,
+                    "forced_answer_probe": forced_answer_probe,
                     "entropy_spike_mask": bool(spike_mask[bi].item()),
                     "diffuse_mask": bool(diffuse_mask[bi].item()),
                     "repeat_degen_detected": bool(repeat_degen_mask[bi].item()),
                     "collapse_candidate": bool((spike_mask[bi] & diffuse_mask[bi]).item()) if collapse_on_diffuse else False,
                 }
+                trace_event = bool(
+                    step in trace_event_steps
+                    or format_mask[bi].item()
+                    or collapse_mask[bi].item()
+                    or answer_zone_trigger_mask[bi].item()
+                )
+                record["trace_event"] = trace_event
+                record["trace_event_kind"] = (
+                    "format" if bool(format_mask[bi].item())
+                    else "collapse" if bool(collapse_mask[bi].item())
+                    else "answer_zone" if bool(answer_zone_trigger_mask[bi].item())
+                    else "checkpoint" if step in trace_event_steps
+                    else None
+                )
+                if trace_event_geometry and trace_event:
+                    record.update(_embedding_geometry_record(
+                        normal_emb,
+                        soft_emb,
+                        last_emb,
+                        bi,
+                        visual_anchor=image_pad_emb,
+                    ))
                 _add_topk_trace_fields(
                     record,
                     tokenizer,
@@ -1202,6 +1442,13 @@ def generate_lead(model, tokenizer, **kwargs):
     stream_callback       = kwargs.pop("stream_callback", None)
     token_trace           = kwargs.pop("token_trace", None)
     trace_topk            = kwargs.pop("trace_topk", 0)
+    trace_event_geometry  = bool(kwargs.pop("trace_event_geometry", False))
+    trace_event_steps     = {int(value) for value in kwargs.pop("trace_event_steps", [0, 1, 2, 4, 8, 16, 32])}
+    trace_route_override_step = int(kwargs.pop("trace_route_override_step", -1))
+    trace_route_override_kind = str(kwargs.pop("trace_route_override_kind", "none"))
+    trace_forced_answer_probe = bool(kwargs.pop("trace_forced_answer_probe", False))
+    trace_probe_gold_choice = kwargs.pop("trace_probe_gold_choice", None)
+    trace_probe_choice_case = kwargs.pop("trace_probe_choice_case", "upper")
     lead_soft_veto_on_diffuse = kwargs.pop("lead_soft_veto_on_diffuse", False)
     lead_veto_entropy_window = kwargs.pop("lead_veto_entropy_window", 16)
     lead_veto_entropy_alpha = kwargs.pop("lead_veto_entropy_alpha", 2.0)
@@ -1239,6 +1486,10 @@ def generate_lead(model, tokenizer, **kwargs):
 
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+    prompt_len = input_ids.shape[1]
+    visual_token_mask = _build_visual_token_mask(input_ids, tokenizer)
+    prompt_hidden_states = None
     batch_size, device = input_ids.shape[0], input_ids.device
     E = model.get_input_embeddings().weight  # [vocab_size, dim]
     def _resolve_token_id(token_text, fallback_text=None):
@@ -1318,9 +1569,17 @@ def generate_lead(model, tokenizer, **kwargs):
             }
             model_inputs["cache_position"] = cache_position
 
+        need_prompt_hidden = trace_event_geometry and past_key_values is None
         with torch.no_grad():
-            outputs = model(**model_inputs, use_cache=True)
+            outputs = model(
+                **model_inputs,
+                use_cache=True,
+                output_hidden_states=need_prompt_hidden,
+                return_dict=True,
+            )
         past_key_values = outputs.past_key_values
+        if need_prompt_hidden and getattr(outputs, "hidden_states", None):
+            prompt_hidden_states = outputs.hidden_states[-1][:, :prompt_len, :].detach()
         if vision_inputs:
             vision_inputs = {}
         cache_position = cache_position[-1:] + 1
@@ -1353,6 +1612,7 @@ def generate_lead(model, tokenizer, **kwargs):
                 injecting[done_mask] = False
         
         cur_entropy = -(probs_original * (probs_original.clamp(min=1e-8).log())).sum(dim=-1)
+        mode_before = mode.clone()
         to_normal = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         to_soft = torch.zeros(cur_batch, dtype=torch.bool, device=device)
         delayed_transition_entry = torch.zeros(cur_batch, dtype=torch.bool, device=device)
@@ -1417,6 +1677,7 @@ def generate_lead(model, tokenizer, **kwargs):
         
         normal_emb = E[next_tokens]
         soft_emb = torch.matmul(probs_original, E)
+        raw_soft_emb = soft_emb
         raw_top2 = torch.topk(probs_original, k=min(2, probs_original.shape[-1]), dim=-1).values
         raw_top1_prob = raw_top2[:, 0]
         raw_margin = (
@@ -1531,6 +1792,26 @@ def generate_lead(model, tokenizer, **kwargs):
             is_soft = is_soft | lead_soft_quota_mask
         is_soft = is_soft & (~lead_soft_veto_mask) & (~lead_format_mask)
         last_emb = torch.where(is_soft[:, None], soft_emb, normal_emb)
+        route_override_active = step == trace_route_override_step and trace_route_override_kind != "none"
+        if route_override_active:
+            if trace_route_override_kind == "hard":
+                last_emb = E[next_tokens]
+            elif trace_route_override_kind == "raw_soft":
+                last_emb = raw_soft_emb
+            elif trace_route_override_kind == "method_soft":
+                last_emb = soft_emb
+            else:
+                raise ValueError(f"Unsupported trace_route_override_kind={trace_route_override_kind}")
+        forced_answer_probe = None
+        if trace_forced_answer_probe and step == trace_route_override_step:
+            forced_answer_probe = _forced_answer_probe_from_route(
+                model, tokenizer, last_emb, attention_mask, past_key_values,
+                cache_position, trace_probe_gold_choice,
+                choice_case=trace_probe_choice_case,
+                prompt_hidden_states=prompt_hidden_states,
+                visual_token_mask=visual_token_mask,
+                prompt_len=prompt_len,
+            )
 
         if max_switch_count is not None and step > 0:
             trigger = (switch_count >= max_switch_count) & (switch_count <= 2 * max_switch_count) & to_normal
@@ -1604,7 +1885,11 @@ def generate_lead(model, tokenizer, **kwargs):
                         "route_signal": route_signal,
                         "route_action": route_action,
                         "route_priority": int(route_priority),
-                        "route_suppressed_by": [],
+                        "route_suppressed_by": (
+                            (["diffuse_repeat_veto"] if bool(lead_soft_veto_mask[bi].item()) else [])
+                            + (["format_cooldown"] if bool(lead_format_mask[bi].item()) else [])
+                            + (["locked_normal"] if bool(locked_normal_mask[bi].item()) else [])
+                        ),
                         "lead_soft_veto": bool(lead_soft_veto_mask[bi].item()),
                         "lead_veto_candidate": bool(lead_veto_candidate[bi].item()),
                         "lead_disable_step0_linebreak_mix": bool(lead_disable_step0_linebreak_mix),
@@ -1643,7 +1928,41 @@ def generate_lead(model, tokenizer, **kwargs):
                         "raw_margin": float(raw_margin[bi].item()),
                         "alpha": float(alpha),
                         "beta": float(beta),
+                        "mode_before": "soft" if int(mode_before[bi].item()) == 0 else "normal",
+                        "cur_ref_entropy": float(cur_ref_entropy[bi].item()),
+                        "threshold_to_soft_b1": float(b1),
+                        "threshold_to_normal_b2": float(b2),
+                        "mode_stay_steps": int(mode_stay_steps[bi].item()),
+                        "switch_count": int(switch_count[bi].item()),
+                        "locked_normal": bool(locked_normal_mask[bi].item()),
+                        "route_override_active": bool(route_override_active),
+                        "route_override_kind": trace_route_override_kind if route_override_active else None,
+                        "forced_answer_probe": forced_answer_probe,
                     }
+                trace_event = bool(
+                    step in trace_event_steps
+                    or to_soft[bi].item()
+                    or to_normal[bi].item()
+                    or lead_format_mask[bi].item()
+                    or lead_soft_veto_mask[bi].item()
+                )
+                record["trace_event"] = trace_event
+                record["trace_event_kind"] = (
+                    "to_soft" if bool(to_soft[bi].item())
+                    else "to_normal" if bool(to_normal[bi].item())
+                    else "format" if bool(lead_format_mask[bi].item())
+                    else "veto" if bool(lead_soft_veto_mask[bi].item())
+                    else "checkpoint" if step in trace_event_steps
+                    else None
+                )
+                if trace_event_geometry and trace_event:
+                    record.update(_embedding_geometry_record(
+                        normal_emb,
+                        raw_soft_emb,
+                        last_emb,
+                        bi,
+                        visual_anchor=start_thinking_emb,
+                    ))
                 _add_topk_trace_fields(
                     record,
                     tokenizer,

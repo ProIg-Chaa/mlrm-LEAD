@@ -1200,3 +1200,33 @@ Guard 补跑目录：`output/experiments/20260604_131704/rerun_format_confidence
 - 结果：COT prefix 基本锁死错误轨迹，VStar 四个长度均为 `1/18`，MMVP 四个长度均为 `0/12`；initial-transition prefix 随长度增加明显恢复正确率，VStar 到 64 token 为 `14/18`，MMVP 到 32/64 token 分别为 `10/12`、`11/12`。
 - 结论：这比 early token divergence 更接近因果证据，说明 early transition 不是单纯格式修复，而是在前 32-64 token 内重定向了可延续的视觉推理轨迹；后续普通 greedy 会沿着早期轨迹继续展开。
 - 详细报告：`result/5-27/early_prefix_replay_report_20260615.md`。
+## 2026-07-12 TALR 紧凑矩阵切换
+
+- 将原计划的 `5 模型 × 14 数据集 × 11 方法 = 770 runs` 缩减为 56 个主 run 和 8 个 OpenVLThinker 外部验证 run。原因是当前研究优先级已转为：统一主结果、最佳工程方法 TALR、Early Trajectory Commitment 的必要证据。
+- 主模型固定为 R1-Onevision-7B、Vision-R1-7B；主数据集固定为 VStar、RealWorldQA fixed200、MMVP、VisuLogic300、VMCBench-dev、POPE-Adversarial、MMK12-Physics；方法固定为 COT、LEAD、initial_transition_only、TALR。
+- 统一口径：greedy（`--no-do_sample`）、temperature 0.6、top-p 0.95、top-k 20、seed 42、max_new_tokens 1024、origin prompt、保存 compact token entropy、trace_topk 0。
+- TALR 定义：early transition + quota 0.05 + format cooldown2/min-step2 + late diffuse/repeat veto。机制定位为 Early Initializer、Budgeted Refiner、Discrete Stability Guard；format guard 只宣称稳定生成，不单独宣称提升 reasoning ability。
+- 取消旧 OpenVLThinker 全矩阵 job `26735`、旧 R1-Onevision-7B-RL pending 全矩阵 job `26736`，停止 VL-Cogito worker；已完成结果保留不删除。
+- 保留 gpu09 allocation `26623` 与 gpu15 allocation `26711`。R1 methods 在 gpu15 运行；Vision methods 首次 job `26737` 落到已有约 71.6GB 占用的 gpu04 并连续 OOM，已立即取消、删除不完整输出，改为排除 gpu04/gpu09/gpu15 的 job `26738` 重新排队。
+- R1/Vision 原 VMCBench COT 完成后，由 watcher 停止旧 baseline runner，并切换到 compact baseline 队列。旧目录中配置完全匹配的 COT/LEAD 直接复用；MMHal、MathVista 等非新 manifest 结果保留但忽略。
+- `main.py` 的 compact entropy summary 新增 switch、to-normal、to-soft、format trigger/active steps 和 diffuse veto 计数。该 instrumentation 只汇总既有 trace 字段，不改变生成。
+- 统一输出根目录沿用 `output/experiments/20260712_uniform_multimodel_full_matrix`，新增 `compact_talr_summary` 汇总目录。
+- 最新机制文档：`result/5-27/early_trajectory_commitment_talr_mechanism_20260712.md`。ETC 指早期轨迹承诺；LTI 指 latent trajectory initialization；TALR 是早期初始化、预算化修正和离散稳定保护的组合。
+- 评测边界：主结论只使用配置匹配的 greedy 结果；sampled 论文复现单列。MMVP 报 sample/pair，RealWorldQA 仅 fixed200，POPE 报二分类完整指标。Runtime error 和 failed extraction 不得混为普通错误。
+- Vision methods 的首次重排 job `26738` 因 sbatch 参数未通过环境变量而退出；job `26739` 虽获得 gpu23，但节点环境给出空 `CUDA_VISIBLE_DEVICES`，导致 `No CUDA GPUs are available`，已取消并清理全部失败输出。修复后固定使用 Slurm 分配空间内的逻辑 `cuda:0`，以 job `26740` 重新排队。两次失败均未进入正式结果。
+- 进一步确认 gpu23 实际 `No devices found`，属于集群 GRES 与物理设备状态不一致，而非模型代码问题；`26740/26741` 已取消并清理。sbatch 增加 `nvidia-smi + torch.cuda.is_available()` 启动前验收，Vision methods 当前以 `26742` 排队并排除 gpu04/gpu09/gpu15/gpu23。
+
+## 2026-07-13 紧凑矩阵运行检查与修复
+
+- baseline transition watcher 在 R1 VMCBench COT 完成后尝试从 tmux 内创建 tmux，触发 nested-session 拒绝，导致 R1 compact baseline 未启动。已直接在 allocation 26623 上启动 compact_r1_baseline_0713，复用前五个已完成 COT，从 POPE-Adversarial COT 继续。
+- Vision methods job 26742 在共享 gpu26 上受到约 20GB 其他进程影响：VStar initial transition 有 1 条 runtime error，VMCBench 运行到约 633 条时出现多次 OOM。两组受污染输出已删除，RWQA/MMVP/VisuLogic 的零 runtime 结果保留。
+- Vision methods 以 job 26770 重新排队，并排除 gpu04/gpu09/gpu15/gpu23/gpu26；启动前继续执行 NVIDIA 与 torch CUDA 双重检查。
+- 检查时进度：R1 initial transition 已完成 VStar、RWQA、MMVP、VisuLogic、VMCBench，正在 POPE-Adversarial 约 614/3000；Vision COT 正在 MMK12-Physics 约 484/500。
+
+## 2026-07-13 集群规范通知后的全面暂停
+
+- 收到集群管理中心通知：禁止登录或使用 gpu12、gpu14、gpu17、gpu18、gpu19、gpu20、gpu25、gpu27、gpu28。
+- 仅通过 mu01 的 Slurm accounting 与项目日志审计，未主动连接上述节点。当前运行任务不在禁用节点。
+- 历史 Slurm 记录确认：job 25808 曾于 2026-05-31 至 2026-06-03 在 gpu28 完成；job 25873 于 2026-06-03 至 2026-06-08 在 gpu28 最终 NODE_FAIL；job 26306 于 2026-06-18 被调度到 gpu14，31 秒后 FAILED。后续迁移时不得再次使用这些节点。
+- 按用户要求暂停全部当前实验：取消 gpu09 allocation 26623 和 pending job 26773；此前 methods allocations 已结束。关闭 compact baseline、methods、transition 与 OpenVL watcher 会话。
+- 检查确认无 un_compact_talr、旧 full-matrix runner 或对应 main.py 进程残留。现有结果、配置、trace 与汇总全部保留，等待迁移到新平台。

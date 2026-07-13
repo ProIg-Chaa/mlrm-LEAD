@@ -201,6 +201,12 @@ def build_entropy_summary(tokenizer, trace):
             "non_reasoning_filtered_entropy": entropy_stats([]),
             "soft_token_count": 0,
             "soft_ratio": None,
+            "switch_count": 0,
+            "to_normal_count": 0,
+            "to_soft_count": 0,
+            "format_cooldown_active_steps": 0,
+            "format_trigger_count": 0,
+            "lead_soft_veto_count": 0,
             "reasoning_soft_token_count": 0,
             "reasoning_soft_ratio": None,
             "relation_token_count": 0,
@@ -228,6 +234,11 @@ def build_entropy_summary(tokenizer, trace):
     reasoning_filtered = []
     non_reasoning_filtered = []
     soft_token_count = 0
+    to_normal_count = 0
+    to_soft_count = 0
+    format_cooldown_active_steps = 0
+    format_trigger_count = 0
+    lead_soft_veto_count = 0
     reasoning_soft_token_count = 0
     reasoning_token_count = 0
     relation_token_count = 0
@@ -263,6 +274,16 @@ def build_entropy_summary(tokenizer, trace):
             soft_token_count += 1
             if is_reasoning:
                 reasoning_soft_token_count += 1
+
+        to_normal_count += int(bool(token.get("to_normal", False)))
+        to_soft_count += int(bool(token.get("to_soft", False)))
+        format_cooldown_active_steps += int(
+            bool(token.get("format_cooldown_active", False))
+        )
+        lead_soft_veto_count += int(bool(token.get("lead_soft_veto", False)))
+        active_count = token.get("format_cooldown_active_count")
+        if active_count is not None:
+            format_trigger_count = max(format_trigger_count, int(active_count))
 
         raw_entropy = token.get("raw_entropy")
         if raw_entropy is not None:
@@ -312,6 +333,12 @@ def build_entropy_summary(tokenizer, trace):
         "non_reasoning_filtered_entropy": entropy_stats(non_reasoning_filtered),
         "soft_token_count": soft_token_count,
         "soft_ratio": soft_token_count / token_count if token_count else None,
+        "switch_count": to_normal_count + to_soft_count,
+        "to_normal_count": to_normal_count,
+        "to_soft_count": to_soft_count,
+        "format_cooldown_active_steps": format_cooldown_active_steps,
+        "format_trigger_count": format_trigger_count,
+        "lead_soft_veto_count": lead_soft_veto_count,
         "reasoning_soft_token_count": reasoning_soft_token_count,
         "reasoning_soft_ratio": (
             reasoning_soft_token_count / reasoning_token_count
@@ -617,6 +644,26 @@ def parse_args() -> argparse.Namespace:
         help="在完整 token 熵轨迹中额外记录每步 raw/filtered top-k 候选；0 表示关闭",
     )
     parser.add_argument(
+        "--trace_event_geometry",
+        action="store_true",
+        help="仅在关键 checkpoint/route event 记录 hard-soft-route embedding 几何；默认关闭",
+    )
+    parser.add_argument(
+        "--trace_event_steps",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 4, 8, 16, 32],
+        help="事件级几何 trace 的固定生成 step",
+    )
+    parser.add_argument("--trace_route_override_step", type=int, default=-1,
+                        help="反事实 replay：仅在该 step 覆盖下一步输入 route；-1 表示关闭")
+    parser.add_argument("--trace_route_override_kind", choices=["none", "hard", "raw_soft", "method_soft"],
+                        default="none", help="反事实 replay 的单步输入 route")
+    parser.add_argument("--trace_route_override_manifest", type=str, default=None,
+                        help="JSON object: sample id -> override step")
+    parser.add_argument("--trace_forced_answer_probe", action="store_true",
+                        help="在 route override 事件旁路强制 Answer marker，记录 A-E probe margin")
+    parser.add_argument(
         "--save_visual_attn_summary",
         action="store_true",
         help="在 cot/cot_greedy 推理时为每个生成 token 记录视觉注意力摘要",
@@ -733,6 +780,11 @@ def main():
     report_path = os.path.join(output_dir, "eval_report.json")
     token_entropy_path = os.path.join(output_dir, "token_entropy.jsonl")
     full_token_entropy_path = os.path.join(output_dir, "token_entropy_full.jsonl")
+    route_override_steps = {}
+    default_route_override_step = args.trace_route_override_step
+    if args.trace_route_override_manifest:
+        with open(args.trace_route_override_manifest, "r", encoding="utf-8") as handle:
+            route_override_steps = {str(key): int(value) for key, value in json.load(handle).items()}
 
     # ---- 加载模型（仅加载一次） ----
     logger.info(f"Loading model: {args.model_name}")
@@ -882,6 +934,12 @@ def main():
         "save_token_entropy": args.save_token_entropy,
         "save_full_token_entropy": args.save_full_token_entropy,
         "trace_topk": args.trace_topk,
+        "trace_event_geometry": args.trace_event_geometry,
+        "trace_event_steps": args.trace_event_steps,
+        "trace_route_override_step": args.trace_route_override_step,
+        "trace_route_override_kind": args.trace_route_override_kind,
+        "trace_route_override_manifest": args.trace_route_override_manifest,
+        "trace_forced_answer_probe": args.trace_forced_answer_probe,
         "save_visual_attn_summary": args.save_visual_attn_summary,
         "visual_attn_summary_last_k": args.visual_attn_summary_last_k,
         "sidecar_attn_on_entropy": args.sidecar_attn_on_entropy,
@@ -913,6 +971,15 @@ def main():
 
         args.image = image_url
         args.prompt = prompt
+        args.trace_route_override_step = route_override_steps.get(
+            str(sample.get("id")), default_route_override_step
+        )
+        gold_match = re.search(r"(?:^|\()\s*([A-Ea-e])", str(sample.get("answer") or ""))
+        args.trace_probe_gold_choice = gold_match.group(1).upper() if gold_match else None
+        options_text = str(sample.get("options") or "")
+        has_lower_labels = bool(re.search(r"\([a-e]\)", options_text))
+        has_upper_labels = bool(re.search(r"\([A-E]\)", options_text))
+        args.trace_probe_choice_case = "lower" if has_lower_labels and not has_upper_labels else "upper"
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()

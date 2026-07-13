@@ -128,6 +128,13 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
     if args.token_entropy_trace is not None:
         gen_kwargs["token_trace"] = args.token_entropy_trace
         gen_kwargs["trace_topk"] = getattr(args, "trace_topk", 0)
+        gen_kwargs["trace_event_geometry"] = getattr(args, "trace_event_geometry", False)
+        gen_kwargs["trace_event_steps"] = getattr(args, "trace_event_steps", [0, 1, 2, 4, 8, 16, 32])
+        gen_kwargs["trace_route_override_step"] = getattr(args, "trace_route_override_step", -1)
+        gen_kwargs["trace_route_override_kind"] = getattr(args, "trace_route_override_kind", "none")
+        gen_kwargs["trace_forced_answer_probe"] = getattr(args, "trace_forced_answer_probe", False)
+        gen_kwargs["trace_probe_gold_choice"] = getattr(args, "trace_probe_gold_choice", None)
+        gen_kwargs["trace_probe_choice_case"] = getattr(args, "trace_probe_choice_case", "upper")
     if getattr(args, "save_visual_attn_summary", False):
         gen_kwargs["log_visual_attn_summary"] = True
         gen_kwargs["visual_attn_summary_last_k"] = args.visual_attn_summary_last_k
