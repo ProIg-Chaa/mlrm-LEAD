@@ -463,6 +463,17 @@ def parse_args() -> argparse.Namespace:
                         help="LEAD 消融：仅第 0 个生成 token 的下一步输入使用 soft embedding，之后全程 normal")
     parser.add_argument("--lead_initial_transition_only", action="store_true",
                         help="LEAD 消融：只保留开头 step0 soft 和首次 soft->normal 的 </think> 过渡混合，之后全程 normal")
+    parser.add_argument("--lead_early_visual_anchor", action="store_true",
+                        help="Inject one question-conditioned visual anchor into the step-0 soft initializer")
+    parser.add_argument("--lead_early_visual_anchor_source", type=str, default="visual_hidden",
+                        choices=["visual_hidden", "image_pad"],
+                        help="Source for the step-0 anchor: real visual hidden states or static image-pad embedding")
+    parser.add_argument("--lead_early_visual_anchor_top_m", type=int, default=8,
+                        help="Number of question-relevant visual tokens pooled for the step-0 anchor")
+    parser.add_argument("--lead_early_visual_anchor_lambda", type=float, default=0.10,
+                        help="Residual weight of the norm-matched step-0 visual anchor")
+    parser.add_argument("--lead_early_visual_anchor_temperature", type=float, default=0.10,
+                        help="Softmax temperature for question-to-visual cosine pooling")
     parser.add_argument("--lead_initial_transition_delay_steps", type=int, default=0,
                         help="LEAD timing 消融：把 initial_transition_only 延迟到第 N 个生成 step；0 等价当前开头 transition")
     parser.add_argument("--lead_disable_step0_linebreak_mix", action="store_true",
@@ -843,6 +854,11 @@ def main():
         "lead_force_normal": args.lead_force_normal,
         "lead_initial_soft_only": args.lead_initial_soft_only,
         "lead_initial_transition_only": args.lead_initial_transition_only,
+        "lead_early_visual_anchor": args.lead_early_visual_anchor,
+        "lead_early_visual_anchor_source": args.lead_early_visual_anchor_source,
+        "lead_early_visual_anchor_top_m": args.lead_early_visual_anchor_top_m,
+        "lead_early_visual_anchor_lambda": args.lead_early_visual_anchor_lambda,
+        "lead_early_visual_anchor_temperature": args.lead_early_visual_anchor_temperature,
         "lead_initial_transition_delay_steps": args.lead_initial_transition_delay_steps,
         "lead_disable_step0_linebreak_mix": args.lead_disable_step0_linebreak_mix,
         "lead_disable_to_normal_transition": args.lead_disable_to_normal_transition,

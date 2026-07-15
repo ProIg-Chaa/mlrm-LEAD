@@ -179,6 +179,11 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["lead_force_normal"] = args.lead_force_normal
             model_inputs["lead_initial_soft_only"] = args.lead_initial_soft_only
             model_inputs["lead_initial_transition_only"] = args.lead_initial_transition_only
+            model_inputs["lead_early_visual_anchor"] = args.lead_early_visual_anchor
+            model_inputs["lead_early_visual_anchor_source"] = args.lead_early_visual_anchor_source
+            model_inputs["lead_early_visual_anchor_top_m"] = args.lead_early_visual_anchor_top_m
+            model_inputs["lead_early_visual_anchor_lambda"] = args.lead_early_visual_anchor_lambda
+            model_inputs["lead_early_visual_anchor_temperature"] = args.lead_early_visual_anchor_temperature
             model_inputs["lead_initial_transition_delay_steps"] = args.lead_initial_transition_delay_steps
             model_inputs["lead_disable_step0_linebreak_mix"] = args.lead_disable_step0_linebreak_mix
             model_inputs["lead_disable_to_normal_transition"] = args.lead_disable_to_normal_transition

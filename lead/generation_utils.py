@@ -1407,6 +1407,60 @@ def generate_cot_visual_reanchor(model, tokenizer, **kwargs):
     return out
 
 
+def _compute_early_actual_visual_anchor(
+    prompt_hidden_states,
+    visual_token_mask,
+    query_state,
+    reference_emb,
+    top_m=8,
+    temperature=0.10,
+):
+    """Build a question-conditioned, norm-matched anchor from visual states."""
+    if int(top_m) <= 0:
+        raise ValueError("top_m must be positive")
+    if float(temperature) <= 0.0:
+        raise ValueError("temperature must be positive")
+
+    device = reference_emb.device
+    prompt_hidden_states = prompt_hidden_states.to(device)
+    visual_token_mask = visual_token_mask.to(device)
+    query_state = query_state.to(device)
+    anchors = reference_emb.clone()
+    applied = torch.zeros(reference_emb.shape[0], dtype=torch.bool, device=device)
+    query_similarity = torch.zeros(
+        reference_emb.shape[0], dtype=reference_emb.dtype, device=device
+    )
+    norm_ratio = torch.ones(
+        reference_emb.shape[0], dtype=reference_emb.dtype, device=device
+    )
+
+    normalized_visual = F.normalize(prompt_hidden_states.float(), dim=-1)
+    normalized_query = F.normalize(query_state.float(), dim=-1)
+    for bi in range(reference_emb.shape[0]):
+        positions = visual_token_mask[bi, : prompt_hidden_states.shape[1]].nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        if positions.numel() == 0:
+            continue
+        scores = torch.matmul(normalized_visual[bi, positions], normalized_query[bi])
+        count = min(int(top_m), int(positions.numel()))
+        top_scores, top_indices = torch.topk(scores, k=count, dim=0)
+        selected = prompt_hidden_states[bi, positions[top_indices]]
+        weights = F.softmax(top_scores / float(temperature), dim=0).to(selected.dtype)
+        raw_anchor = torch.sum(selected * weights.unsqueeze(-1), dim=0)
+        raw_norm = torch.linalg.vector_norm(raw_anchor.float()).clamp_min(1e-8)
+        ref_norm = torch.linalg.vector_norm(reference_emb[bi].float())
+        ratio = ref_norm / raw_norm
+        anchors[bi] = raw_anchor * ratio.to(raw_anchor.dtype)
+        applied[bi] = True
+        query_similarity[bi] = torch.sum(weights.float() * top_scores).to(
+            query_similarity.dtype
+        )
+        norm_ratio[bi] = ratio.to(norm_ratio.dtype)
+
+    return anchors, applied, query_similarity, norm_ratio
+
+
 def generate_lead(model, tokenizer, **kwargs):
 
     # ---- **model_inputs ----
@@ -1465,6 +1519,27 @@ def generate_lead(model, tokenizer, **kwargs):
     lead_force_normal = kwargs.pop("lead_force_normal", False)
     lead_initial_soft_only = kwargs.pop("lead_initial_soft_only", False)
     lead_initial_transition_only = kwargs.pop("lead_initial_transition_only", False)
+    lead_early_visual_anchor = kwargs.pop("lead_early_visual_anchor", False)
+    lead_early_visual_anchor_source = kwargs.pop(
+        "lead_early_visual_anchor_source", "visual_hidden"
+    )
+    lead_early_visual_anchor_top_m = int(
+        kwargs.pop("lead_early_visual_anchor_top_m", 8)
+    )
+    lead_early_visual_anchor_lambda = float(
+        kwargs.pop("lead_early_visual_anchor_lambda", 0.10)
+    )
+    lead_early_visual_anchor_temperature = float(
+        kwargs.pop("lead_early_visual_anchor_temperature", 0.10)
+    )
+    if lead_early_visual_anchor_source not in {"visual_hidden", "image_pad"}:
+        raise ValueError("Unsupported lead_early_visual_anchor_source")
+    if not 0.0 <= lead_early_visual_anchor_lambda <= 1.0:
+        raise ValueError("lead_early_visual_anchor_lambda must be in [0, 1]")
+    if lead_early_visual_anchor_top_m <= 0:
+        raise ValueError("lead_early_visual_anchor_top_m must be positive")
+    if lead_early_visual_anchor_temperature <= 0.0:
+        raise ValueError("lead_early_visual_anchor_temperature must be positive")
     lead_initial_transition_delay_steps = int(kwargs.pop("lead_initial_transition_delay_steps", 0) or 0)
     if lead_initial_transition_delay_steps < 0:
         lead_initial_transition_delay_steps = 0
@@ -1569,7 +1644,9 @@ def generate_lead(model, tokenizer, **kwargs):
             }
             model_inputs["cache_position"] = cache_position
 
-        need_prompt_hidden = trace_event_geometry and past_key_values is None
+        need_prompt_hidden = (
+            trace_event_geometry or lead_early_visual_anchor
+        ) and past_key_values is None
         with torch.no_grad():
             outputs = model(
                 **model_inputs,
@@ -1678,6 +1755,15 @@ def generate_lead(model, tokenizer, **kwargs):
         normal_emb = E[next_tokens]
         soft_emb = torch.matmul(probs_original, E)
         raw_soft_emb = soft_emb
+        early_visual_anchor_applied = torch.zeros(
+            cur_batch, dtype=torch.bool, device=device
+        )
+        early_visual_anchor_query_similarity = torch.zeros(
+            cur_batch, dtype=soft_emb.dtype, device=device
+        )
+        early_visual_anchor_norm_ratio = torch.ones(
+            cur_batch, dtype=soft_emb.dtype, device=device
+        )
         raw_top2 = torch.topk(probs_original, k=min(2, probs_original.shape[-1]), dim=-1).values
         raw_top1_prob = raw_top2[:, 0]
         raw_margin = (
@@ -1766,6 +1852,51 @@ def generate_lead(model, tokenizer, **kwargs):
         if step == 0:
             if not lead_disable_step0_linebreak_mix:
                 soft_emb = 0.9 * soft_emb + 0.1 * line_break_emb
+            if lead_early_visual_anchor:
+                if lead_early_visual_anchor_source == "visual_hidden":
+                    if prompt_hidden_states is None:
+                        raise RuntimeError("Early visual anchor requires prompt hidden states")
+                    (
+                        early_anchor,
+                        early_visual_anchor_applied,
+                        early_visual_anchor_query_similarity,
+                        early_visual_anchor_norm_ratio,
+                    ) = _compute_early_actual_visual_anchor(
+                        prompt_hidden_states=prompt_hidden_states,
+                        visual_token_mask=visual_token_mask,
+                        query_state=prompt_hidden_states[:, prompt_len - 1, :],
+                        reference_emb=soft_emb,
+                        top_m=lead_early_visual_anchor_top_m,
+                        temperature=lead_early_visual_anchor_temperature,
+                    )
+                else:
+                    imgpad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                    static_anchor = E[imgpad_id].unsqueeze(0).expand_as(soft_emb)
+                    static_norm = torch.linalg.vector_norm(
+                        static_anchor.float(), dim=-1
+                    ).clamp_min(1e-8)
+                    reference_norm = torch.linalg.vector_norm(
+                        soft_emb.float(), dim=-1
+                    )
+                    early_visual_anchor_norm_ratio = (
+                        reference_norm / static_norm
+                    ).to(soft_emb.dtype)
+                    early_anchor = static_anchor * early_visual_anchor_norm_ratio[:, None]
+                    early_visual_anchor_applied = torch.ones(
+                        cur_batch, dtype=torch.bool, device=device
+                    )
+                    if prompt_hidden_states is not None:
+                        early_visual_anchor_query_similarity = F.cosine_similarity(
+                            prompt_hidden_states[:, prompt_len - 1, :].float(),
+                            static_anchor.float(),
+                            dim=-1,
+                        ).to(soft_emb.dtype)
+                weight = lead_early_visual_anchor_lambda
+                soft_emb = torch.where(
+                    early_visual_anchor_applied[:, None],
+                    (1.0 - weight) * soft_emb + weight * early_anchor,
+                    soft_emb,
+                )
         else:
             mixed_emb = alpha * soft_emb + a * (1 - alpha) * start_thinking_emb
             
@@ -1894,6 +2025,18 @@ def generate_lead(model, tokenizer, **kwargs):
                         "lead_veto_candidate": bool(lead_veto_candidate[bi].item()),
                         "lead_disable_step0_linebreak_mix": bool(lead_disable_step0_linebreak_mix),
                         "lead_disable_to_normal_transition": bool(lead_disable_to_normal_transition),
+                        "early_visual_anchor_applied": bool(early_visual_anchor_applied[bi].item()),
+                        "early_visual_anchor_source": (
+                            lead_early_visual_anchor_source if lead_early_visual_anchor else None
+                        ),
+                        "early_visual_anchor_top_m": int(lead_early_visual_anchor_top_m),
+                        "early_visual_anchor_lambda": float(lead_early_visual_anchor_lambda),
+                        "early_visual_anchor_query_similarity": float(
+                            early_visual_anchor_query_similarity[bi].item()
+                        ),
+                        "early_visual_anchor_norm_ratio": float(
+                            early_visual_anchor_norm_ratio[bi].item()
+                        ),
                         "lead_initial_transition_delay_steps": int(lead_initial_transition_delay_steps),
                         "lead_delayed_transition_entry": bool(delayed_transition_entry[bi].item()),
                         "lead_delayed_transition_exit": bool(delayed_transition_exit[bi].item()),
