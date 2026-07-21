@@ -1688,20 +1688,12 @@ def generate_lead(model, tokenizer, **kwargs):
     lead_soft_quota_ratio = float(kwargs.pop("lead_soft_quota_ratio", 0.0) or 0.0)
     lead_refinement_window = int(kwargs.pop("lead_refinement_window", 0) or 0)
     lead_refinement_soft_cap = int(kwargs.pop("lead_refinement_soft_cap", 0) or 0)
-    lead_refinement_entropy_threshold = float(
-        kwargs.pop("lead_refinement_entropy_threshold", b1)
-    )
-    lead_refinement_soft_mix_lambda = float(
-        kwargs.pop("lead_refinement_soft_mix_lambda", 1.0)
-    )
     lead_guard_candidate_only = bool(kwargs.pop("lead_guard_candidate_only", False))
     lead_disable_answer_zone_lock = bool(
         kwargs.pop("lead_disable_answer_zone_lock", False)
     )
     if lead_refinement_window < 0 or lead_refinement_soft_cap < 0:
         raise ValueError("TALR refinement window and soft cap must be non-negative")
-    if not 0.0 <= lead_refinement_soft_mix_lambda <= 1.0:
-        raise ValueError("TALR refinement soft mix lambda must be in [0, 1]")
     lead_windowed_refinement = (
         lead_refinement_window > 0 and lead_refinement_soft_cap > 0
     )
@@ -2008,7 +2000,7 @@ def generate_lead(model, tokenizer, **kwargs):
                 (mode == 1)
                 & (cur_entropy > cur_ref_entropy)
                 & (~locked_normal_mask)
-                & (cur_entropy > lead_refinement_entropy_threshold)
+                & (cur_entropy > b1)
             )
             to_soft = entropy_refinement_proposal & allow_switch
             if (
@@ -2341,14 +2333,7 @@ def generate_lead(model, tokenizer, **kwargs):
             is_soft = is_soft | lead_soft_quota_mask
         is_soft = is_soft | lead_refinement_mask
         is_soft = is_soft & (~lead_soft_veto_mask) & (~lead_format_mask)
-        refinement_emb = (
-            lead_refinement_soft_mix_lambda * soft_emb
-            + (1.0 - lead_refinement_soft_mix_lambda) * normal_emb
-        )
-        routed_soft_emb = torch.where(
-            lead_refinement_mask[:, None], refinement_emb, soft_emb
-        )
-        last_emb = torch.where(is_soft[:, None], routed_soft_emb, normal_emb)
+        last_emb = torch.where(is_soft[:, None], soft_emb, normal_emb)
         route_override_active = step == trace_route_override_step and trace_route_override_kind != "none"
         if route_override_active:
             if trace_route_override_kind == "hard":
@@ -2571,12 +2556,6 @@ def generate_lead(model, tokenizer, **kwargs):
                         ),
                         "lead_refinement_window": int(lead_refinement_window),
                         "lead_refinement_soft_cap": int(lead_refinement_soft_cap),
-                        "lead_refinement_entropy_threshold": float(
-                            lead_refinement_entropy_threshold
-                        ),
-                        "lead_refinement_soft_mix_lambda": float(
-                            lead_refinement_soft_mix_lambda
-                        ),
                         "lead_refinement_count_before": int(
                             lead_refinement_counts[orig]
                         ),

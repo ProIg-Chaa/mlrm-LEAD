@@ -1,0 +1,46 @@
+{
+  "sampling": "answer-label-stratified random sample; restored source order",
+  "seed": 42,
+  "per_label": 250,
+  "variants": {
+    "adversarial": {
+      "full_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_adversarial_full3000.jsonl",
+      "active_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_adversarial.jsonl",
+      "subset_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_adversarial_balanced500_seed42.jsonl",
+      "rows": 500,
+      "answer_counts": {
+        "A": 250,
+        "B": 250
+      },
+      "unique_images": 329,
+      "missing_images": 0,
+      "sha256": "741e8cd0ef388ef95e511ffef9bc4b75f64d89ad5a2df7822b1f07bf67e965d9"
+    },
+    "popular": {
+      "full_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_popular_full3000.jsonl",
+      "active_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_popular.jsonl",
+      "subset_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_popular_balanced500_seed42.jsonl",
+      "rows": 500,
+      "answer_counts": {
+        "A": 250,
+        "B": 250
+      },
+      "unique_images": 330,
+      "missing_images": 0,
+      "sha256": "83b474bb4b4810cc1bdb9adfd093375e52b2b5a4edd11aa7dee4fa486374411e"
+    },
+    "random": {
+      "full_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_random_full3000.jsonl",
+      "active_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_random.jsonl",
+      "subset_path": "/root/gushuo/proj/mlrm-LEAD/data/pope_random_balanced500_seed42.jsonl",
+      "rows": 500,
+      "answer_counts": {
+        "A": 250,
+        "B": 250
+      },
+      "unique_images": 338,
+      "missing_images": 0,
+      "sha256": "709a41334fe1384909e96c61a6f1ea5344ed89761c52404d06991b4504c1a725"
+    }
+  }
+}

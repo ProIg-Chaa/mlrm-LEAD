@@ -210,9 +210,6 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
             model_inputs["lead_refinement_entropy_threshold"] = (
                 args.lead_refinement_entropy_threshold
             )
-            model_inputs["lead_refinement_soft_mix_lambda"] = (
-                args.lead_refinement_soft_mix_lambda
-            )
             model_inputs["lead_guard_candidate_only"] = args.lead_guard_candidate_only
             model_inputs["lead_disable_answer_zone_lock"] = args.lead_disable_answer_zone_lock
             model_inputs["convergence_words"] = "</think>"

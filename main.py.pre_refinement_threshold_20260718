@@ -538,10 +538,6 @@ def parse_args() -> argparse.Namespace:
                         help="TALR: allow entropy-proposed soft refinement only this many tokens after the first soft-to-normal transition")
     parser.add_argument("--lead_refinement_soft_cap", type=int, default=0,
                         help="TALR: strict per-sample cap on post-transition soft refinement steps")
-    parser.add_argument("--lead_refinement_entropy_threshold", type=float, default=1.0,
-                        help="TALR: absolute entropy floor for refinement proposals")
-    parser.add_argument("--lead_refinement_soft_mix_lambda", type=float, default=1.0,
-                        help="TALR: soft weight for post-transition refinement embeddings")
     parser.add_argument("--lead_guard_candidate_only", action="store_true",
                         help="Apply and count LEAD format/diffuse guards only when a TALR refinement is actually proposed")
     parser.add_argument("--lead_disable_answer_zone_lock", action="store_true",
@@ -946,8 +942,6 @@ def main():
         "lead_soft_quota_ratio": args.lead_soft_quota_ratio,
         "lead_refinement_window": args.lead_refinement_window,
         "lead_refinement_soft_cap": args.lead_refinement_soft_cap,
-        "lead_refinement_entropy_threshold": args.lead_refinement_entropy_threshold,
-        "lead_refinement_soft_mix_lambda": args.lead_refinement_soft_mix_lambda,
         "lead_guard_candidate_only": args.lead_guard_candidate_only,
         "lead_disable_answer_zone_lock": args.lead_disable_answer_zone_lock,
         "cot_prompt_mode": args.cot_prompt_mode,
