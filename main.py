@@ -732,8 +732,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trace_route_override_step", type=int, default=-1,
                         help="反事实 replay：仅在该 step 覆盖下一步输入 route；-1 表示关闭")
-    parser.add_argument("--trace_route_override_kind", choices=["none", "hard", "raw_soft", "method_soft"],
-                        default="none", help="反事实 replay 的单步输入 route")
+    parser.add_argument(
+        "--trace_route_override_kind",
+        choices=["none", "hard", "raw_soft", "method_soft", "contracted_soft"],
+        default="none",
+        help="反事实 replay 的单步输入 route",
+    )
+    parser.add_argument(
+        "--trace_route_override_mix_lambda",
+        type=float,
+        default=0.95,
+        help="contracted_soft 反事实 route 中 soft embedding 的比例",
+    )
     parser.add_argument("--trace_route_override_manifest", type=str, default=None,
                         help="JSON object: sample id -> override step")
     parser.add_argument("--trace_forced_answer_probe", action="store_true",
@@ -1041,6 +1051,7 @@ def main():
         "trace_event_steps": args.trace_event_steps,
         "trace_route_override_step": args.trace_route_override_step,
         "trace_route_override_kind": args.trace_route_override_kind,
+        "trace_route_override_mix_lambda": args.trace_route_override_mix_lambda,
         "trace_route_override_manifest": args.trace_route_override_manifest,
         "trace_forced_answer_probe": args.trace_forced_answer_probe,
         "save_visual_attn_summary": args.save_visual_attn_summary,

@@ -393,6 +393,19 @@ def generate_cot(model, tokenizer, **kwargs):
     stream_callback = kwargs.pop("stream_callback", None)
     token_trace = kwargs.pop("token_trace", None)
     trace_topk = kwargs.pop("trace_topk", 0)
+    trace_route_override_step = int(kwargs.pop("trace_route_override_step", -1))
+    trace_route_override_kind = str(kwargs.pop("trace_route_override_kind", "none"))
+    trace_route_override_mix_lambda = float(
+        kwargs.pop("trace_route_override_mix_lambda", 0.95)
+    )
+    if not 0.0 <= trace_route_override_mix_lambda <= 1.0:
+        raise ValueError("trace_route_override_mix_lambda must be in [0, 1]")
+    trace_external_route_vector = kwargs.pop("trace_external_route_vector", None)
+    trace_external_route_source = kwargs.pop("trace_external_route_source", None)
+    trace_soft_vector_collector = kwargs.pop("trace_soft_vector_collector", None)
+    trace_capture_soft_vector_step = int(
+        kwargs.pop("trace_capture_soft_vector_step", -1)
+    )
     forced_prefix_ids = kwargs.pop("forced_prefix_ids", None)
     if forced_prefix_ids is not None:
         forced_prefix_ids = [int(x) for x in forced_prefix_ids]
@@ -420,6 +433,7 @@ def generate_cot(model, tokenizer, **kwargs):
     generated = input_ids.clone()
     attn_mask = attention_mask.clone() if attention_mask is not None else None
     past_key_values = None
+    next_inputs_embeds = None
     cache_position = torch.arange(generated.shape[1], device=device, dtype=torch.long)
     attn_config_values = None
     if log_visual_attn_summary:
@@ -443,10 +457,11 @@ def generate_cot(model, tokenizer, **kwargs):
                 if attn_mask is not None:
                     attention_mask_new = torch.ones((cur_batch, 1), dtype=attn_mask.dtype, device=device)
                     attn_mask = torch.cat([attn_mask, attention_mask_new], dim=1)
-                model_inputs = {
-                    "input_ids": next_tokens.unsqueeze(1),
-                    "past_key_values": past_key_values,
-                }
+                model_inputs = {"past_key_values": past_key_values}
+                if next_inputs_embeds is None:
+                    model_inputs["input_ids"] = next_tokens.unsqueeze(1)
+                else:
+                    model_inputs["inputs_embeds"] = next_inputs_embeds.unsqueeze(1)
                 if attn_mask is not None:
                     model_inputs["attention_mask"] = attn_mask
                 model_inputs["cache_position"] = cache_position
@@ -497,8 +512,112 @@ def generate_cot(model, tokenizer, **kwargs):
             else:
                 next_tokens = torch.argmax(probs, dim=-1)
 
+            embedding_weight = model.get_input_embeddings().weight
+            normal_emb = embedding_weight[next_tokens]
+            soft_emb = torch.matmul(
+                raw_probs.to(embedding_weight.dtype), embedding_weight
+            )
+            if (
+                trace_soft_vector_collector is not None
+                and step == trace_capture_soft_vector_step
+            ):
+                trace_soft_vector_collector.append(
+                    {
+                        "step": int(step),
+                        "soft_embedding": soft_emb[0].detach().float().cpu(),
+                        "hard_embedding": normal_emb[0].detach().float().cpu(),
+                        "raw_entropy": float(raw_entropy[0].item()),
+                        "selected_token_id": int(next_tokens[0].item()),
+                        "selected_token_prob": float(
+                            raw_probs[0, next_tokens[0]].item()
+                        ),
+                    }
+                )
+            raw_top_values = torch.topk(
+                raw_probs, k=min(5, raw_probs.shape[-1]), dim=-1
+            ).values
+            raw_top1_prob = raw_top_values[:, 0]
+            raw_margin = (
+                raw_top_values[:, 0] - raw_top_values[:, 1]
+                if raw_top_values.shape[-1] > 1
+                else raw_top_values[:, 0]
+            )
+            route_override_active = (
+                step == trace_route_override_step
+                and trace_route_override_kind != "none"
+            )
+            next_inputs_embeds = None
+            external_norm = None
+            external_hard_cosine = None
+            if route_override_active:
+                if trace_route_override_kind == "hard":
+                    next_inputs_embeds = normal_emb
+                elif trace_route_override_kind in {"raw_soft", "method_soft"}:
+                    next_inputs_embeds = soft_emb
+                elif trace_route_override_kind == "contracted_soft":
+                    next_inputs_embeds = (
+                        trace_route_override_mix_lambda * soft_emb
+                        + (1.0 - trace_route_override_mix_lambda) * normal_emb
+                    )
+                elif trace_route_override_kind in {
+                    "external_soft",
+                    "external_contracted",
+                }:
+                    if trace_external_route_vector is None:
+                        raise ValueError(
+                            f"{trace_route_override_kind} requires "
+                            "trace_external_route_vector"
+                        )
+                    external_emb = torch.as_tensor(
+                        trace_external_route_vector,
+                        device=device,
+                        dtype=embedding_weight.dtype,
+                    )
+                    if external_emb.ndim == 1:
+                        external_emb = external_emb.unsqueeze(0)
+                    if external_emb.shape != normal_emb.shape:
+                        if external_emb.shape[0] == 1 and cur_batch > 1:
+                            external_emb = external_emb.expand(cur_batch, -1)
+                        else:
+                            raise ValueError(
+                                "External route vector shape mismatch: "
+                                f"{tuple(external_emb.shape)} vs "
+                                f"{tuple(normal_emb.shape)}"
+                            )
+                    if trace_route_override_kind == "external_soft":
+                        next_inputs_embeds = external_emb
+                    else:
+                        next_inputs_embeds = (
+                            trace_route_override_mix_lambda * external_emb
+                            + (1.0 - trace_route_override_mix_lambda) * normal_emb
+                        )
+                    external_norm = torch.linalg.vector_norm(
+                        external_emb.float(), dim=-1
+                    )
+                    external_hard_cosine = F.cosine_similarity(
+                        external_emb.float(), normal_emb.float(), dim=-1
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported trace_route_override_kind={trace_route_override_kind}"
+                    )
+
+            hard_norm = torch.linalg.vector_norm(normal_emb.float(), dim=-1)
+            soft_norm = torch.linalg.vector_norm(soft_emb.float(), dim=-1)
+            soft_hard_delta = torch.linalg.vector_norm(
+                (soft_emb - normal_emb).float(), dim=-1
+            )
+            soft_hard_cosine = F.cosine_similarity(
+                soft_emb.float(), normal_emb.float(), dim=-1
+            )
+
             for bi, orig in enumerate(unfinished_idx):
                 token_id = next_tokens[bi].item()
+                token_text = tokenizer.decode(
+                    [int(token_id)],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
                 all_generated[orig].append(token_id)
                 if token_trace is not None:
                     sidecar_record = None
@@ -529,10 +648,64 @@ def generate_cot(model, tokenizer, **kwargs):
                         "step": int(step),
                         "batch_index": int(orig),
                         "token_id": int(token_id),
+                        "token_text": token_text,
+                        "token_is_newline": "\n" in token_text,
+                        "token_is_whitespace": not token_text.strip(),
+                        "token_is_punctuation": bool(
+                            token_text.strip()
+                            and all(not char.isalnum() for char in token_text.strip())
+                        ),
+                        "token_is_answer_marker": (
+                            "answer" in token_text.lower()
+                            or "</think" in token_text.lower()
+                        ),
                         "raw_entropy": float(raw_entropy[bi].item()),
                         "filtered_entropy": float(filtered_entropy[bi].item()),
                         "selected_prob": float(probs[bi, next_tokens[bi]].item()),
                         "mode": "normal",
+                        "raw_top1_prob": float(raw_top1_prob[bi].item()),
+                        "raw_margin": float(raw_margin[bi].item()),
+                        "raw_top2_mass": float(
+                            raw_top_values[bi, : min(2, raw_top_values.shape[-1])]
+                            .sum()
+                            .item()
+                        ),
+                        "raw_top5_mass": float(raw_top_values[bi].sum().item()),
+                        "hard_embedding_norm": float(hard_norm[bi].item()),
+                        "soft_embedding_norm": float(soft_norm[bi].item()),
+                        "soft_hard_l2": float(soft_hard_delta[bi].item()),
+                        "soft_hard_relative_l2": float(
+                            (
+                                soft_hard_delta[bi]
+                                / hard_norm[bi].clamp_min(1e-8)
+                            ).item()
+                        ),
+                        "soft_hard_cosine": float(soft_hard_cosine[bi].item()),
+                        "route_override_active": bool(route_override_active),
+                        "route_override_kind": (
+                            trace_route_override_kind if route_override_active else None
+                        ),
+                        "route_override_mix_lambda": (
+                            float(trace_route_override_mix_lambda)
+                            if route_override_active
+                            else None
+                        ),
+                        "external_route_source": (
+                            trace_external_route_source
+                            if route_override_active
+                            and trace_route_override_kind.startswith("external_")
+                            else None
+                        ),
+                        "external_embedding_norm": (
+                            float(external_norm[bi].item())
+                            if external_norm is not None
+                            else None
+                        ),
+                        "external_hard_cosine": (
+                            float(external_hard_cosine[bi].item())
+                            if external_hard_cosine is not None
+                            else None
+                        ),
                     }
                     _add_topk_trace_fields(
                         record,
@@ -587,6 +760,8 @@ def generate_cot(model, tokenizer, **kwargs):
                 break
             generated = generated[keep_idx]
             next_tokens = next_tokens[keep_idx]
+            if next_inputs_embeds is not None:
+                next_inputs_embeds = next_inputs_embeds[keep_idx]
             if attention_mask is not None:
                 attention_mask = attention_mask[keep_idx]
             if attn_mask is not None:

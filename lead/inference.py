@@ -125,6 +125,21 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
         "max_new_tokens": args.max_new_tokens,
         "do_sample": args.do_sample,
     }
+    forced_prefix_ids = getattr(args, "forced_prefix_ids", None)
+    if forced_prefix_ids is not None:
+        gen_kwargs["forced_prefix_ids"] = forced_prefix_ids
+    soft_vector_collector = getattr(args, "trace_soft_vector_collector", None)
+    if soft_vector_collector is not None:
+        gen_kwargs["trace_soft_vector_collector"] = soft_vector_collector
+        gen_kwargs["trace_capture_soft_vector_step"] = getattr(
+            args, "trace_capture_soft_vector_step", -1
+        )
+    external_route_vector = getattr(args, "trace_external_route_vector", None)
+    if external_route_vector is not None:
+        gen_kwargs["trace_external_route_vector"] = external_route_vector
+        gen_kwargs["trace_external_route_source"] = getattr(
+            args, "trace_external_route_source", None
+        )
     if args.token_entropy_trace is not None:
         gen_kwargs["token_trace"] = args.token_entropy_trace
         gen_kwargs["trace_topk"] = getattr(args, "trace_topk", 0)
@@ -132,6 +147,9 @@ def run_single_inference(model, processor, tokenizer, args: argparse.Namespace) 
         gen_kwargs["trace_event_steps"] = getattr(args, "trace_event_steps", [0, 1, 2, 4, 8, 16, 32])
         gen_kwargs["trace_route_override_step"] = getattr(args, "trace_route_override_step", -1)
         gen_kwargs["trace_route_override_kind"] = getattr(args, "trace_route_override_kind", "none")
+        gen_kwargs["trace_route_override_mix_lambda"] = getattr(
+            args, "trace_route_override_mix_lambda", 0.95
+        )
         gen_kwargs["trace_forced_answer_probe"] = getattr(args, "trace_forced_answer_probe", False)
         gen_kwargs["trace_probe_gold_choice"] = getattr(args, "trace_probe_gold_choice", None)
         gen_kwargs["trace_probe_choice_case"] = getattr(args, "trace_probe_choice_case", "upper")

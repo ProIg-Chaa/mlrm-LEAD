@@ -1,0 +1,18 @@
+{
+  "experiment_id": "C1_TTR_SOFT_STATE_DOSE_RESPONSE",
+  "research_question": "How does intervention strength trade off causal utility, damage, and image-source specificity at matched trajectory checkpoints?",
+  "hypothesis": "Intermediate contraction strengths preserve true-image utility while reducing harmful trajectory displacement; source-specific gains should exceed nonvisual controls.",
+  "model": "R1-Onevision-7B-RL",
+  "events": 1024,
+  "samples": 128,
+  "event_types": ["fixed_1", "fixed_2", "fixed_4", "fixed_8", "fixed_16", "fixed_32", "entropy_top1", "random_control"],
+  "new_mix_lambdas": [0.20, 0.40, 0.60, 0.70],
+  "reused_mix_lambdas": [0.80, 0.95, 1.00],
+  "sources": ["true_image", "swapped_image", "masked_image", "random", "dataset_noise"],
+  "baseline": "matched hard branch at the same sample and checkpoint",
+  "primary_metrics": ["fixed_minus_damaged", "prediction_flip_rate", "true_image_specificity", "gold_margin_shift"],
+  "secondary_metrics": ["effect_by_checkpoint", "effect_by_dataset", "actionability_rate"],
+  "success_gate": "At least one intermediate lambda improves the pooled utility-risk frontier over lambda 0.95 or reveals a reproducible source-specific dose response.",
+  "stop_rule": "Do not tune further if utility and damage are source-invariant across the full 0.20-1.00 curve or if apparent gains do not replicate across checkpoints and datasets.",
+  "seed": 42
+}
