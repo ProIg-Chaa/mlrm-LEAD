@@ -400,6 +400,11 @@ def generate_cot(model, tokenizer, **kwargs):
     )
     if not 0.0 <= trace_route_override_mix_lambda <= 1.0:
         raise ValueError("trace_route_override_mix_lambda must be in [0, 1]")
+    trace_route_override_duration = int(
+        kwargs.pop("trace_route_override_duration", 1)
+    )
+    if trace_route_override_duration < 1:
+        raise ValueError("trace_route_override_duration must be >= 1")
     trace_external_route_vector = kwargs.pop("trace_external_route_vector", None)
     trace_external_route_source = kwargs.pop("trace_external_route_source", None)
     trace_soft_vector_collector = kwargs.pop("trace_soft_vector_collector", None)
@@ -543,7 +548,8 @@ def generate_cot(model, tokenizer, **kwargs):
                 else raw_top_values[:, 0]
             )
             route_override_active = (
-                step == trace_route_override_step
+                trace_route_override_step <= step
+                < trace_route_override_step + trace_route_override_duration
                 and trace_route_override_kind != "none"
             )
             next_inputs_embeds = None
@@ -562,6 +568,7 @@ def generate_cot(model, tokenizer, **kwargs):
                 elif trace_route_override_kind in {
                     "external_soft",
                     "external_contracted",
+                    "external_residual",
                 }:
                     if trace_external_route_vector is None:
                         raise ValueError(
@@ -586,6 +593,15 @@ def generate_cot(model, tokenizer, **kwargs):
                             )
                     if trace_route_override_kind == "external_soft":
                         next_inputs_embeds = external_emb
+                    elif trace_route_override_kind == "external_residual":
+                        # The supplied tensor is a direction, not an old-token
+                        # embedding. Re-anchor it at the current hard token so
+                        # multi-step interventions do not pull toward the token
+                        # produced at the original checkpoint.
+                        next_inputs_embeds = (
+                            normal_emb
+                            + trace_route_override_mix_lambda * external_emb
+                        )
                     else:
                         next_inputs_embeds = (
                             trace_route_override_mix_lambda * external_emb
@@ -687,6 +703,16 @@ def generate_cot(model, tokenizer, **kwargs):
                         ),
                         "route_override_mix_lambda": (
                             float(trace_route_override_mix_lambda)
+                            if route_override_active
+                            else None
+                        ),
+                        "route_override_duration": (
+                            int(trace_route_override_duration)
+                            if route_override_active
+                            else None
+                        ),
+                        "route_override_offset": (
+                            int(step - trace_route_override_step)
                             if route_override_active
                             else None
                         ),
@@ -1701,6 +1727,17 @@ def generate_lead(model, tokenizer, **kwargs):
     trace_event_steps     = {int(value) for value in kwargs.pop("trace_event_steps", [0, 1, 2, 4, 8, 16, 32])}
     trace_route_override_step = int(kwargs.pop("trace_route_override_step", -1))
     trace_route_override_kind = str(kwargs.pop("trace_route_override_kind", "none"))
+    trace_route_override_mix_lambda = float(
+        kwargs.pop("trace_route_override_mix_lambda", 0.95)
+    )
+    trace_external_route_vector = kwargs.pop("trace_external_route_vector", None)
+    trace_external_route_source = kwargs.pop("trace_external_route_source", None)
+    trace_soft_vector_collector = kwargs.pop("trace_soft_vector_collector", None)
+    trace_capture_soft_vector_step = int(
+        kwargs.pop("trace_capture_soft_vector_step", -1)
+    )
+    if not 0.0 <= trace_route_override_mix_lambda <= 1.0:
+        raise ValueError("trace_route_override_mix_lambda must be in [0, 1]")
     trace_forced_answer_probe = bool(kwargs.pop("trace_forced_answer_probe", False))
     trace_probe_gold_choice = kwargs.pop("trace_probe_gold_choice", None)
     trace_probe_choice_case = kwargs.pop("trace_probe_choice_case", "upper")
@@ -2249,6 +2286,22 @@ def generate_lead(model, tokenizer, **kwargs):
         normal_emb = E[next_tokens]
         soft_emb = torch.matmul(probs_original, E)
         raw_soft_emb = soft_emb
+        if (
+            trace_soft_vector_collector is not None
+            and step == trace_capture_soft_vector_step
+        ):
+            trace_soft_vector_collector.append(
+                {
+                    "step": int(step),
+                    "soft_embedding": raw_soft_emb[0].detach().float().cpu(),
+                    "hard_embedding": normal_emb[0].detach().float().cpu(),
+                    "raw_entropy": float(cur_entropy[0].item()),
+                    "selected_token_id": int(next_tokens[0].item()),
+                    "selected_token_prob": float(
+                        probs_original[0, next_tokens[0]].item()
+                    ),
+                }
+            )
         if capture_logits_sink is not None and step == 0:
             soft_hard_cos = F.cosine_similarity(
                 raw_soft_emb.float(), normal_emb.float(), dim=-1
@@ -2532,6 +2585,35 @@ def generate_lead(model, tokenizer, **kwargs):
                 last_emb = raw_soft_emb
             elif trace_route_override_kind == "method_soft":
                 last_emb = soft_emb
+            elif trace_route_override_kind in {
+                "external_residual",
+                "method_plus_external_residual",
+            }:
+                if trace_external_route_vector is None:
+                    raise ValueError(
+                        "external_residual requires trace_external_route_vector"
+                    )
+                external_emb = torch.as_tensor(
+                    trace_external_route_vector,
+                    device=device,
+                    dtype=E.dtype,
+                )
+                if external_emb.ndim == 1:
+                    external_emb = external_emb.unsqueeze(0)
+                if external_emb.shape != last_emb.shape:
+                    if external_emb.shape[0] == 1 and last_emb.shape[0] > 1:
+                        external_emb = external_emb.expand(last_emb.shape[0], -1)
+                    else:
+                        raise ValueError(
+                            "External residual shape mismatch: "
+                            f"{tuple(external_emb.shape)} vs {tuple(last_emb.shape)}"
+                        )
+                route_origin = (
+                    last_emb
+                    if trace_route_override_kind == "method_plus_external_residual"
+                    else E[next_tokens]
+                )
+                last_emb = route_origin + trace_route_override_mix_lambda * external_emb
             else:
                 raise ValueError(f"Unsupported trace_route_override_kind={trace_route_override_kind}")
         forced_answer_probe = None

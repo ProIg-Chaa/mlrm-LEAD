@@ -335,9 +335,10 @@ def generate_branch(
         "forced_prefix_ids": prefix_ids,
         "trace_route_override_step": event_step,
         "trace_route_override_kind": (
-            "hard" if branch == "hard" else "external_contracted"
+            "hard" if branch == "hard" else "external_residual"
         ),
         "trace_route_override_mix_lambda": args.mix_lambda,
+        "trace_route_override_duration": args.override_duration,
         "trace_external_route_source": branch,
     }
     if args.save_token_trace:
@@ -388,6 +389,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--mix-lambda", type=float, default=0.95)
+    parser.add_argument("--override-duration", type=int, default=1)
     parser.add_argument("--generic-noise-sigma", type=float, default=30.0)
     parser.add_argument("--trace-topk", type=int, default=20)
     parser.add_argument("--save-token-trace", action="store_true")
@@ -409,6 +411,8 @@ def main() -> int:
     self_test()
     if not 0.0 <= args.mix_lambda <= 1.0:
         raise ValueError("--mix-lambda must be in [0, 1]")
+    if args.override_duration < 1:
+        raise ValueError("--override-duration must be >= 1")
     rows = read_jsonl(args.manifest)
     if args.limit is not None:
         rows = rows[: args.limit]
@@ -735,7 +739,14 @@ def main() -> int:
             if torch.cuda.is_available():
                 gc.collect()
                 torch.cuda.empty_cache()
-            vector = None if branch == "hard" else vectors[branch]
+            # The generation path re-anchors this fixed residual at each
+            # current hard token. Duration=1 is algebraically equivalent to
+            # the original contracted external-vector intervention.
+            vector = (
+                None
+                if branch == "hard"
+                else vectors[branch].float() - receiver_hard.float()
+            )
             answer, tokens, trace, elapsed = generate_branch(
                 model,
                 processor,
@@ -775,6 +786,7 @@ def main() -> int:
                 "reproduction_pass": reproduced,
                 "latency_seconds": elapsed,
                 "error_type": None,
+                "override_duration": int(args.override_duration),
             }
             append_jsonl(results_path, result)
             if args.save_token_trace:
@@ -802,12 +814,16 @@ def main() -> int:
         "completed_branches": completed,
         "reproduction_failures": reproduction_failures,
         "mix_lambda": args.mix_lambda,
+        "override_duration": args.override_duration,
         "runtime_precision": str(next(model.parameters()).dtype),
         "attention_implementation": "sdpa",
         "generic_noise_sigma": args.generic_noise_sigma,
         "seed": args.seed,
         "receiver_image_policy": "true image for all decoding branches",
-        "donor_usage": "one matched-norm residual vector at the event step only",
+        "donor_usage": (
+            "one matched-norm residual direction re-anchored at the current "
+            f"hard token for {args.override_duration} consecutive step(s)"
+        ),
         "residual_definition": "true soft minus aligned control soft",
         "residual_norm_policy": "match the true soft-to-hard displacement norm",
         "shuffle_policy": "same dataset and checkpoint, next distinct sample",
