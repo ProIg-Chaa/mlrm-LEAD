@@ -1730,6 +1730,9 @@ def generate_lead(model, tokenizer, **kwargs):
     trace_route_override_mix_lambda = float(
         kwargs.pop("trace_route_override_mix_lambda", 0.95)
     )
+    trace_route_override_duration = int(
+        kwargs.pop("trace_route_override_duration", 1)
+    )
     trace_external_route_vector = kwargs.pop("trace_external_route_vector", None)
     trace_external_route_source = kwargs.pop("trace_external_route_source", None)
     trace_soft_vector_collector = kwargs.pop("trace_soft_vector_collector", None)
@@ -1738,6 +1741,8 @@ def generate_lead(model, tokenizer, **kwargs):
     )
     if not 0.0 <= trace_route_override_mix_lambda <= 1.0:
         raise ValueError("trace_route_override_mix_lambda must be in [0, 1]")
+    if trace_route_override_duration < 1:
+        raise ValueError("trace_route_override_duration must be >= 1")
     trace_forced_answer_probe = bool(kwargs.pop("trace_forced_answer_probe", False))
     trace_probe_gold_choice = kwargs.pop("trace_probe_gold_choice", None)
     trace_probe_choice_case = kwargs.pop("trace_probe_choice_case", "upper")
@@ -2577,7 +2582,11 @@ def generate_lead(model, tokenizer, **kwargs):
             lead_refinement_mask[:, None], refinement_emb, soft_emb
         )
         last_emb = torch.where(is_soft[:, None], routed_soft_emb, normal_emb)
-        route_override_active = step == trace_route_override_step and trace_route_override_kind != "none"
+        route_override_active = (
+            trace_route_override_step <= step
+            < trace_route_override_step + trace_route_override_duration
+            and trace_route_override_kind != "none"
+        )
         if route_override_active:
             if trace_route_override_kind == "hard":
                 last_emb = E[next_tokens]
@@ -2887,6 +2896,12 @@ def generate_lead(model, tokenizer, **kwargs):
                         "locked_normal": bool(locked_normal_mask[bi].item()),
                         "route_override_active": bool(route_override_active),
                         "route_override_kind": trace_route_override_kind if route_override_active else None,
+                        "route_override_duration": (
+                            int(trace_route_override_duration) if route_override_active else None
+                        ),
+                        "route_override_offset": (
+                            int(step - trace_route_override_step) if route_override_active else None
+                        ),
                         "forced_answer_probe": forced_answer_probe,
                     }
                 trace_event = bool(

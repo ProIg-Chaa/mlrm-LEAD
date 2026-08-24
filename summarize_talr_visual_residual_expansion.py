@@ -14,6 +14,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "script"))
 from evaluate_specialized_results import evaluate
+from evaluate_realworldqa_mcq import evaluate as evaluate_realworldqa
 
 
 BRANCHES = ("talr", "talr_true_residual", "talr_random_residual")
@@ -112,13 +113,37 @@ def evaluate_mcq(dataset_rows, result_rows):
     return report, enriched
 
 
+def evaluate_realworldqa_standardized(dataset_rows, result_rows):
+    report, enriched = evaluate_realworldqa(dataset_rows, result_rows)
+    standardized = []
+    for row in enriched:
+        item = dict(row)
+        item["specialized_gold"] = item.get("realworldqa_gold")
+        item["specialized_pred"] = item.get("realworldqa_pred")
+        item["specialized_match_method"] = item.get("realworldqa_match_method")
+        item["specialized_is_correct"] = item.get("realworldqa_is_correct", False)
+        standardized.append(item)
+    return report, standardized
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--dataset-name", choices=("mmvp", "vstar"), required=True)
+    parser.add_argument(
+        "--dataset-name",
+        choices=("mmvp", "vstar", "realworldqa", "visulogic"),
+        required=True,
+    )
     parser.add_argument("--num-shards", type=int, default=2)
     args = parser.parse_args()
+    config_path = args.root / "shard_0" / "config.json"
+    if config_path.is_file():
+        selection = json.loads(config_path.read_text(encoding="utf-8")).get("selection", "unknown")
+    elif args.root.name == "full_merged":
+        selection = "full_merged"
+    else:
+        selection = args.root.name
     merged_dir = args.root / "merged"
     all_rows = []
     for shard in range(args.num_shards):
@@ -143,6 +168,8 @@ def main():
         rows.sort(key=lambda row: int(row["id"]))
         if args.dataset_name == "mmvp":
             report, enriched = evaluate(dataset, rows, "mmvp")
+        elif args.dataset_name == "realworldqa":
+            report, enriched = evaluate_realworldqa_standardized(dataset, rows)
         else:
             report, enriched = evaluate_mcq(dataset, rows)
         branch_dir = merged_dir / branch
@@ -188,9 +215,9 @@ def main():
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     lines = [
-        f"# TALR + Visual Residual: {args.dataset_name.upper()} Atlas-Held-Out",
+        f"# TALR + Visual Residual: {args.dataset_name.upper()} {selection}",
         "",
-        "Atlas samples are excluded; generation settings and residual strength are frozen.",
+        "Generation settings and residual strength are frozen. Selection is recorded in the heading.",
         "",
         "| Method | Sample Acc | Pair Acc | Failed |",
         "|---|---:|---:|---:|",

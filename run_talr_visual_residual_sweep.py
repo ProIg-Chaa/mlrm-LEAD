@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare frozen TALR with a one-shot visual residual augmentation."""
+"""Sweep visual-residual strength and duration on frozen TALR trajectories."""
 
 from __future__ import annotations
 
@@ -209,6 +209,7 @@ def run_talr(
     override_step: int = -1,
     external_residual: torch.Tensor | None = None,
     residual_strength: float = 0.75,
+    residual_duration: int = 1,
 ) -> tuple[str, list[int], list[dict[str, Any]], float]:
     inputs, prompt_len = prepare(
         processor, sample, str(sample["image"]), next(model.parameters()).device
@@ -223,6 +224,7 @@ def run_talr(
         kwargs["trace_route_override_step"] = override_step
         kwargs["trace_route_override_kind"] = "method_plus_external_residual"
         kwargs["trace_route_override_mix_lambda"] = residual_strength
+        kwargs["trace_route_override_duration"] = residual_duration
         kwargs["trace_external_route_vector"] = external_residual
         kwargs["trace_external_route_source"] = "true_mask_residual"
     started = time.perf_counter()
@@ -338,20 +340,45 @@ def main() -> int:
         choices=("full", "atlas_heldout", "atlas_completion"),
         default="atlas_heldout",
     )
-    parser.add_argument("--pairs", type=int, default=32)
+    parser.add_argument("--pairs", type=int, default=0)
     parser.add_argument("--samples", type=int, default=0)
+    parser.add_argument("--selected-manifest", type=Path)
     parser.add_argument("--seed", type=int, default=20260820)
-    parser.add_argument("--residual-strength", type=float, default=0.75)
+    parser.add_argument(
+        "--residual-strengths", type=float, nargs="+", default=[0.75]
+    )
+    parser.add_argument(
+        "--residual-durations", type=int, nargs="+", default=[1]
+    )
+    parser.add_argument(
+        "--residual-branches",
+        choices=("true", "random", "both"),
+        default="both",
+        help="Run the visual direction, matched random control, or both.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--sanity", action="store_true")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
-    if not 0.0 <= args.residual_strength <= 1.0:
-        raise ValueError("Residual strength must be in [0, 1]")
+    strengths = sorted(set(float(value) for value in args.residual_strengths))
+    durations = sorted(set(int(value) for value in args.residual_durations))
+    residual_branches = (
+        ("talr_true_residual",)
+        if args.residual_branches == "true"
+        else ("talr_random_residual",)
+        if args.residual_branches == "random"
+        else ("talr_true_residual", "talr_random_residual")
+    )
+    if not strengths or any(not 0.0 <= value <= 1.0 for value in strengths):
+        raise ValueError("Residual strengths must be in [0, 1]")
+    if not durations or any(value < 1 for value in durations):
+        raise ValueError("Residual durations must be >= 1")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    subset_path = args.output_dir / f"{args.dataset_name}_{args.selection}_subset.jsonl"
+    subset_path = args.output_dir / (
+        f"{args.dataset_name}_{args.selection}_pairs{args.pairs}_samples{args.samples}_subset.jsonl"
+    )
     samples = prepare_subset(
         args.data,
         args.atlas_manifest,
@@ -362,6 +389,15 @@ def main() -> int:
         args.samples,
         args.seed,
     )
+    if args.selected_manifest is not None:
+        selected = {
+            (str(row["dataset"]), str(row["id"]))
+            for row in read_jsonl(args.selected_manifest)
+        }
+        samples = [
+            row for row in samples
+            if (args.dataset_name, str(row["id"])) in selected
+        ]
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
         raise ValueError("Invalid shard configuration")
     if args.dataset_name == "mmvp":
@@ -382,10 +418,15 @@ def main() -> int:
     results_path = args.output_dir / "results.jsonl"
     traces_path = args.output_dir / "trace_summary.jsonl"
     masks_dir = args.output_dir / "masks"
-    completed = set()
+    completed: set[tuple[str, str, float, int]] = set()
     if results_path.is_file():
         completed = {
-            (str(row["id"]), str(row["branch"]))
+            (
+                str(row["id"]),
+                str(row["branch"]),
+                float(row.get("residual_strength", 0.0)),
+                int(row.get("residual_duration", 0)),
+            )
             for row in read_jsonl(results_path)
             if row.get("error_type") is None
         }
@@ -411,7 +452,13 @@ def main() -> int:
 
     for index, sample in enumerate(samples, start=1):
         sample_id = str(sample["id"])
-        if all((sample_id, branch) in completed for branch in BRANCHES):
+        expected = {(sample_id, "talr", 0.0, 0)}
+        expected.update(
+            (sample_id, branch, strength, duration)
+            for strength in strengths for duration in durations
+            for branch in residual_branches
+        )
+        if expected <= completed:
             continue
         print(f"[{index}/{len(samples)}] id={sample_id}", flush=True)
         baseline_text, baseline_tokens, baseline_trace, baseline_time = run_talr(
@@ -431,33 +478,47 @@ def main() -> int:
             "options": sample.get("options"),
             "answer": sample.get("answer"),
             "refinement_step": event_step,
-            "residual_strength": args.residual_strength,
             "error_type": None,
         }
-        append_jsonl(results_path, {
-            **common,
-            "branch": "talr",
-            "model_answer": baseline_text,
-            "generated_token_ids": baseline_tokens,
-            "latency_seconds": baseline_time,
-            "injection_applied": False,
-        })
-        append_jsonl(traces_path, {
-            "id": sample["id"],
-            "branch": "talr",
-            "refinement_steps": [int(token["step"]) for token in refinement_events],
-        })
+        baseline_key = (sample_id, "talr", 0.0, 0)
+        if baseline_key not in completed:
+            append_jsonl(results_path, {
+                **common,
+                "branch": "talr",
+                "residual_strength": 0.0,
+                "residual_duration": 0,
+                "model_answer": baseline_text,
+                "generated_token_ids": baseline_tokens,
+                "latency_seconds": baseline_time,
+                "injection_applied": False,
+            })
+            append_jsonl(traces_path, {
+                "id": sample["id"],
+                "branch": "talr",
+                "residual_strength": 0.0,
+                "residual_duration": 0,
+                "refinement_steps": [
+                    int(token["step"]) for token in refinement_events
+                ],
+            })
 
         if event_step < 0:
-            for branch in BRANCHES[1:]:
-                append_jsonl(results_path, {
-                    **common,
-                    "branch": branch,
-                    "model_answer": baseline_text,
-                    "generated_token_ids": baseline_tokens,
-                    "latency_seconds": 0.0,
-                    "injection_applied": False,
-                })
+            for strength in strengths:
+                for duration in durations:
+                    for branch in residual_branches:
+                        key = (sample_id, branch, strength, duration)
+                        if key in completed:
+                            continue
+                        append_jsonl(results_path, {
+                            **common,
+                            "branch": branch,
+                            "residual_strength": strength,
+                            "residual_duration": duration,
+                            "model_answer": baseline_text,
+                            "generated_token_ids": baseline_tokens,
+                            "latency_seconds": 0.0,
+                            "injection_applied": False,
+                        })
             continue
 
         prefix_ids = baseline_tokens[:event_step + 1]
@@ -488,46 +549,54 @@ def main() -> int:
         random_direction = random_direction_like(
             visual_direction, target_norm, stable_seed(sample_id, args.seed)
         )
-        for branch, direction in (
-            ("talr_true_residual", visual_direction),
-            ("talr_random_residual", random_direction),
-        ):
-            text, token_ids, trace, elapsed = run_talr(
-                model, processor, tokenizer, sample, math_ids_tensor,
-                args.max_new_tokens,
-                forced_prefix_ids=prefix_ids,
-                override_step=event_step,
-                external_residual=direction,
-                residual_strength=args.residual_strength,
-            )
-            append_jsonl(results_path, {
-                **common,
-                "branch": branch,
-                "model_answer": text,
-                "generated_token_ids": token_ids,
-                "latency_seconds": elapsed,
-                "injection_applied": True,
-                "target_soft_hard_norm": target_norm,
-                "raw_visual_residual_norm": raw_residual_norm,
-            })
-            append_jsonl(traces_path, {
-                "id": sample["id"],
-                "branch": branch,
-                "refinement_steps": [
-                    int(token["step"]) for token in trace
-                    if token.get("lead_refinement_active", False)
-                ],
-                "override_step": event_step,
-                "target_soft_hard_norm": target_norm,
-                "raw_visual_residual_norm": raw_residual_norm,
-            })
+        for strength in strengths:
+            for duration in durations:
+                directions = {
+                    "talr_true_residual": visual_direction,
+                    "talr_random_residual": random_direction,
+                }
+                for branch in residual_branches:
+                    direction = directions[branch]
+                    key = (sample_id, branch, strength, duration)
+                    if key in completed:
+                        continue
+                    text, token_ids, trace, elapsed = run_talr(
+                        model, processor, tokenizer, sample, math_ids_tensor,
+                        args.max_new_tokens,
+                        forced_prefix_ids=prefix_ids,
+                        override_step=event_step,
+                        external_residual=direction,
+                        residual_strength=strength,
+                        residual_duration=duration,
+                    )
+                    append_jsonl(results_path, {
+                        **common,
+                        "branch": branch,
+                        "residual_strength": strength,
+                        "residual_duration": duration,
+                        "model_answer": text,
+                        "generated_token_ids": token_ids,
+                        "latency_seconds": elapsed,
+                        "injection_applied": True,
+                        "target_soft_hard_norm": target_norm,
+                        "raw_visual_residual_norm": raw_residual_norm,
+                    })
+                    append_jsonl(traces_path, {
+                        "id": sample["id"],
+                        "branch": branch,
+                        "residual_strength": strength,
+                        "residual_duration": duration,
+                        "refinement_steps": [
+                            int(token["step"]) for token in trace
+                            if token.get("lead_refinement_active", False)
+                        ],
+                        "override_step": event_step,
+                        "target_soft_hard_norm": target_norm,
+                        "raw_visual_residual_norm": raw_residual_norm,
+                    })
         gc.collect()
         torch.cuda.empty_cache()
 
-    rows = read_jsonl(results_path)
-    for branch in BRANCHES:
-        branch_rows = [row for row in rows if row.get("branch") == branch]
-        write_jsonl(args.output_dir / branch / "results.jsonl", branch_rows)
     config = {
         "model": str(args.model),
         "dataset": f"{args.dataset_name} {args.selection}",
@@ -538,7 +607,12 @@ def main() -> int:
         "excluded_atlas_samples": args.selection == "atlas_heldout",
         "talr": "W8K2-T1.25-lambda0.95-NoGuard",
         "visual_action": "first active TALR refinement + true-minus-mean-mask residual",
-        "residual_strength": args.residual_strength,
+        "selected_manifest": (
+            str(args.selected_manifest) if args.selected_manifest else None
+        ),
+        "residual_strengths": strengths,
+        "residual_durations": durations,
+        "residual_branches": list(residual_branches),
         "random_control": "matched-norm random direction at the same event",
         "seed": args.seed,
         "num_shards": args.num_shards,
@@ -547,6 +621,26 @@ def main() -> int:
     (args.output_dir / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    rows = read_jsonl(results_path)
+    actual = {
+        (
+            str(row["id"]), str(row["branch"]),
+            float(row.get("residual_strength", 0.0)),
+            int(row.get("residual_duration", 0)),
+        )
+        for row in rows if row.get("error_type") is None
+    }
+    missing = sorted(expected_key for sample in samples for expected_key in (
+        {(str(sample["id"]), "talr", 0.0, 0)}
+        | {
+            (str(sample["id"]), branch, strength, duration)
+            for strength in strengths for duration in durations
+            for branch in residual_branches
+        }
+    ) if expected_key not in actual)
+    if missing:
+        raise RuntimeError(f"Missing {len(missing)} sweep results")
+    (args.output_dir / "RUN_COMPLETE").touch()
     print(json.dumps(config, ensure_ascii=False, indent=2))
     return 0
 
